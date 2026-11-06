@@ -11,7 +11,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
-from .config import AppConfig
+from .config import AppConfig, project_path
 from .imu_hw import MPU6050Reader
 from .control import IntensityEstimator, Controller
 from .audio import AudioEngine
@@ -164,6 +164,16 @@ class AppRuntime(QtCore.QObject):
 
     def set_mode(self, mode: str) -> None:
         self.cfg.ctrl.mode = "single" if mode == "single" else "layered"
+
+    def apply_config(self, cfg: AppConfig) -> None:
+        """
+        Switches the running app to a new config (e.g. Import config).
+        Controller/estimator pick it up via update_parameters() each tick;
+        the audio engine also reloads its layers from cfg.audio.layer_files.
+        """
+        self.cfg = cfg
+        self.audio.apply_config(cfg.audio)
+        self.update_parameters()
 
     def update_parameters(self) -> None:
         """
@@ -585,7 +595,7 @@ class MainWindow(QtWidgets.QMainWindow):
         g = QtWidgets.QGroupBox("Recording")
         layout = QtWidgets.QVBoxLayout(g)
 
-        self.rec_check = QtWidgets.QCheckBox("Record CSV time series to ./logs/")
+        self.rec_check = QtWidgets.QCheckBox("Record CSV time series to logs/")
         self.rec_check.stateChanged.connect(lambda s: self._toggle_recording(bool(s)))
         self.rec_check.setToolTip("Logs gyro feature/envelope/x/gains/state at control rate.")
         layout.addWidget(self.rec_check)
@@ -770,8 +780,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.T3_spin.setValue(self.cfg.ctrl.T3)
 
         # Persist calibration result locally
-        _ensure_dir("logs")
-        out_path = os.path.join("logs", f"calibration_{_timestamp()}.json")
+        logs_dir = str(project_path("logs"))
+        _ensure_dir(logs_dir)
+        out_path = os.path.join(logs_dir, f"calibration_{_timestamp()}.json")
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump({
                 "floor": res.floor,
@@ -810,9 +821,9 @@ class MainWindow(QtWidgets.QMainWindow):
             s = f.read()
         cfg2 = AppConfig.from_json(s)
 
-        # Replace config and update runtime pointer
+        # Replace config and push it into the running components
         self.cfg = cfg2
-        self.rt.cfg = cfg2
+        self.rt.apply_config(cfg2)
 
         # Update visible controls
         self.mode_combo.setCurrentText(cfg2.ctrl.mode)

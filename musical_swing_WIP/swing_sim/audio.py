@@ -20,7 +20,7 @@ except (ImportError, OSError):
     # the module importable, with playback simply reporting unavailable.
     sd = None
 
-from .config import AudioConfig
+from .config import AudioConfig, project_path
 
 
 @dataclass
@@ -124,33 +124,83 @@ class AudioEngine:
         self._master_cap = 0.35
 
         self._stream: Optional["sd.OutputStream"] = None
-        self.status = AudioStatus(running=False, message="Audio not started")
+        self.load_issues: List[str] = []
+        self._status_message = ""
+        self._set_status(False, "Audio not started")
 
-        Path(self.cfg.library_dir).mkdir(parents=True, exist_ok=True)
+        self.library_path().mkdir(parents=True, exist_ok=True)
         self._load_configured_layers()
 
     # ---------------------------
     # Library / layer management
     # ---------------------------
 
+    def library_path(self) -> Path:
+        """cfg.library_dir, with relative paths taken from the project folder."""
+        return project_path(self.cfg.library_dir)
+
     def library_files(self) -> List[str]:
         """Filenames currently sitting in the library directory."""
-        d = Path(self.cfg.library_dir)
+        d = self.library_path()
         if not d.exists():
             return []
         return sorted(p.name for p in d.iterdir() if p.is_file())
 
     def _load_configured_layers(self) -> None:
-        for i, filename in enumerate(self.cfg.layer_files):
-            if not filename:
-                continue
+        """
+        (Re)loads all 3 layers from cfg.layer_files; a None entry clears
+        that layer. Don't let one missing/corrupt file take down the whole
+        engine on an unattended device -- leave that layer silent and
+        surface the problem in status instead.
+        """
+        self.load_issues = []
+        files = (list(self.cfg.layer_files) + [None, None, None])[:3]
+        for i, filename in enumerate(files):
             try:
-                self.assign_layer(i, filename)
+                self.assign_layer(i, filename or None)
             except Exception as e:
-                # Don't let one missing/corrupt file at startup take down
-                # the whole engine on an unattended device -- leave that
-                # layer silent and surface the problem in status instead.
-                self.status = AudioStatus(running=False, message=f"Layer {i + 1} load issue: {e}")
+                with self._lock:
+                    self._layers[i] = LibraryLayer()  # keeps the configured name in cfg
+                self.load_issues.append(f"Layer {i + 1} load issue: {e}")
+        self._set_status(self.status.running, self._status_message)
+
+    def _set_status(self, running: bool, message: str) -> None:
+        """Stream status, with any layer load issues kept appended so they stay visible."""
+        self._status_message = message
+        self.status = AudioStatus(running=running, message=" | ".join([message] + self.load_issues))
+
+    def _resolve_library_file(self, filename: str) -> Path:
+        if Path(filename).name != filename:
+            raise ValueError(f"Library filename must not include a folder: {filename!r}")
+        d = self.library_path()
+        path = d / filename
+        if path.is_file():
+            return path
+        # Allow "riser" for "riser.wav", as long as only one file matches.
+        if not Path(filename).suffix and d.is_dir():
+            matches = [p for p in d.iterdir() if p.is_file() and p.stem == filename]
+            if len(matches) == 1:
+                return matches[0]
+        raise FileNotFoundError(f"No such library file: {filename} (in {d})")
+
+    def apply_config(self, cfg: AudioConfig) -> None:
+        """
+        Switches to a new AudioConfig (e.g. an imported config file) and
+        reloads all 3 layers from its layer_files. Restarts the stream
+        only if a setting the open stream depends on changed.
+        """
+        restart = (
+            cfg.sample_rate != self.cfg.sample_rate
+            or cfg.block_size != self.cfg.block_size
+            or cfg.enabled != self.cfg.enabled
+        )
+        if restart:
+            self.stop()
+        self.cfg = cfg
+        self.library_path().mkdir(parents=True, exist_ok=True)
+        self._load_configured_layers()
+        if restart:
+            self.start()
 
     def assign_layer(self, layer_idx: int, filename: Optional[str]) -> None:
         """
@@ -165,9 +215,7 @@ class AudioEngine:
         if not filename:
             new_layer = LibraryLayer(filename=None)
         else:
-            path = Path(self.cfg.library_dir) / filename
-            if not path.is_file():
-                raise FileNotFoundError(f"No such library file: {filename}")
+            path = self._resolve_library_file(filename)
             data = load_library_file(str(path), self.cfg.sample_rate)
             new_layer = LibraryLayer(filename=filename, data=data)
 
@@ -217,10 +265,10 @@ class AudioEngine:
 
     def start(self) -> None:
         if not self.cfg.enabled:
-            self.status = AudioStatus(running=False, message="Audio disabled in config")
+            self._set_status(False, "Audio disabled in config")
             return
         if sd is None:
-            self.status = AudioStatus(running=False, message="sounddevice not installed")
+            self._set_status(False, "sounddevice not installed")
             return
         if self._stream is not None:
             return
@@ -233,9 +281,9 @@ class AudioEngine:
                 callback=self._callback,
             )
             self._stream.start()
-            self.status = AudioStatus(running=True, message="Audio running")
+            self._set_status(True, "Audio running")
         except Exception as e:
-            self.status = AudioStatus(running=False, message=f"Audio error: {e}")
+            self._set_status(False, f"Audio error: {e}")
             self._stream = None
 
     def stop(self) -> None:
@@ -246,7 +294,7 @@ class AudioEngine:
             self._stream.close()
         finally:
             self._stream = None
-            self.status = AudioStatus(running=False, message="Audio stopped")
+            self._set_status(False, "Audio stopped")
 
     # ---------------------------
     # Realtime callback

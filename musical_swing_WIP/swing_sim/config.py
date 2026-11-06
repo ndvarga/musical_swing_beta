@@ -1,11 +1,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict, field, fields
+from pathlib import Path
 from typing import Literal, Dict, List, Any, Optional
 import json
 
 
 Mode = Literal["layered", "single"]
+
+# musical_swing_WIP/. Relative paths in the config (library_dir, logs) are
+# taken from here, so they mean the same folder no matter which directory
+# the app is launched from (e.g. as a service on the Pi).
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def project_path(p: str) -> Path:
+    """p as-is if absolute (or ~), otherwise relative to PROJECT_ROOT."""
+    path = Path(p).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 @dataclass
@@ -53,7 +65,8 @@ class AudioConfig:
 
     library_dir: str = "layers" # folder with layer files
 
-    layer_files: List[Optional[str]] = field(default_factory=lambda: [None, None, None])
+    # TODO: currently placeholder layers
+    layer_files: List[Optional[str]] = field(default_factory=lambda: ["riser.wav", None, None])
 
     noise_level: float = 0.08        # third layer can include noise feel
 

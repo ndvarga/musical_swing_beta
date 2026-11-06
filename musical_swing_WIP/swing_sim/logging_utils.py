@@ -4,7 +4,7 @@ import csv
 import os
 import time
 from typing import Optional, Dict, Any
-from .config import AppConfig
+from .config import AppConfig, project_path
 
 
 class DataLogger:
@@ -14,6 +14,7 @@ class DataLogger:
         self.path: Optional[str] = None
 
     def start(self, cfg: AppConfig, out_dir: str = "logs") -> str:
+        out_dir = str(project_path(out_dir))
         os.makedirs(out_dir, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
         path = os.path.join(out_dir, f"run_{ts}.csv")
