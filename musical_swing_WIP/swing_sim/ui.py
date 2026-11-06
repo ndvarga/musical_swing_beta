@@ -18,12 +18,13 @@ from .audio import AudioEngine
 from .calibration import CalibrationManager, CalibrationResult
 from .logging_utils import DataLogger
 from .swing_widget import SwingWidget
-from .api_server import (
+# TODO: api servier not implemented
+"""from .api_server import (
     create_app,
     start_api_server_thread,
     TelemetryHub,
     TelemetrySnapshot,
-)
+)"""
 from .speaker import SpeakerManager
 
 
@@ -85,12 +86,16 @@ class AppRuntime(QtCore.QObject):
         # app talks to over WiFi. Replace the placeholder MAC address
         # below with your enclosure speaker's real address -- find it
         # with `bluetoothctl devices` after pairing.
-        self.telemetry = TelemetryHub()
+        
+        #  TODO: not implemented
+        #  self.telemetry = TelemetryHub()
         self.speaker = SpeakerManager(speaker_mac="AA:BB:CC:DD:EE:FF", audio=self.audio)
-        start_api_server_thread(
+
+        # TODO: not implemented
+        """start_api_server_thread(
             create_app(self.cfg, self.audio, self.controller, self.telemetry, self.speaker),
             port=8000,
-        )
+        )"""
 
         self.imu_hw.start()
         self.imu_hw.calibrate_bias(seconds=2.0)  # keep the swing still/hanging during this
@@ -282,7 +287,8 @@ class AppRuntime(QtCore.QObject):
         self.audio.set_gains(out.gains)
 
         # Push to the keeper app's live telemetry feed
-        self.telemetry.push(TelemetrySnapshot(
+        # TODO: not implemented
+        """self.telemetry.push(TelemetrySnapshot(
             t=t_now,
             x_norm=self.x_norm,
             raw_feature=self.raw_feature,
@@ -291,7 +297,7 @@ class AppRuntime(QtCore.QObject):
             status=self.status,
             quiet=out.quiet,
             chatter=self.chatter,
-        ))
+        ))"""
 
         # Plot buffers
         self.t_buf.append(t_now)
