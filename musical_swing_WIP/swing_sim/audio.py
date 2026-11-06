@@ -5,7 +5,6 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
-
 import numpy as np
 
 try:
@@ -114,6 +113,11 @@ class AudioEngine:
         self.cfg = cfg
         self._lock = threading.Lock()
 
+        # Fail-safe mutes, keyed by reason ("paused", "imu", "speaker", ...),
+        # kept separate from cfg.safe_mute so a fault clearing never
+        # overrides the user's own Safe mute setting, and vice versa.
+        self._fault_mutes: set = set()
+
         self._layers: List[LibraryLayer] = [LibraryLayer() for _ in range(3)]
         self._target_gains = np.zeros(3, dtype=float)
         self._current_gains = np.zeros(3, dtype=float)  # audio-thread-only, no lock needed
@@ -185,7 +189,27 @@ class AudioEngine:
             self._master_cap = float(cap)
 
     def set_safe_mute(self, mute: bool) -> None:
+        """The user's own mute (UI checkbox / keeper app)."""
         self.cfg.safe_mute = bool(mute)
+
+    def set_fault_mute(self, reason: str, mute: bool) -> None:
+        """
+        Mutes (or releases) for one fail-safe reason. Output stays silent
+        while any reason is set or the user's safe mute is on.
+        """
+        with self._lock:
+            if mute:
+                self._fault_mutes.add(reason)
+            else:
+                self._fault_mutes.discard(reason)
+
+    def mute_reasons(self) -> List[str]:
+        """Everything currently muting output, for status displays."""
+        with self._lock:
+            reasons = sorted(self._fault_mutes)
+        if self.cfg.safe_mute:
+            reasons.insert(0, "safe_mute")
+        return reasons
 
     def set_gains(self, gains: Tuple[float, float, float]) -> None:
         with self._lock:
@@ -229,11 +253,8 @@ class AudioEngine:
     # ---------------------------
 
     def _callback(self, outdata, frames, time_info, status) -> None:
-        if self.cfg.safe_mute:
-            outdata[:] = np.zeros((frames, 1), dtype=np.float32)
-            return
-
         with self._lock:
+            muted = self.cfg.safe_mute or bool(self._fault_mutes)
             target = self._target_gains.copy()
             master = float(self._master_cap)
             # Snapshot the layer *references* -- if assign_layer() swaps
@@ -242,6 +263,13 @@ class AudioEngine:
             # new clip takes effect cleanly on the next callback. No torn
             # reads, no locking needed for the actual mixing work below.
             layers = list(self._layers)
+
+        if muted:
+            # Mute is immediate, but unmuting fades in from zero via the
+            # gain smoothing below instead of jumping back to the old gains.
+            self._current_gains[:] = 0.0
+            outdata[:] = np.zeros((frames, 1), dtype=np.float32)
+            return
 
         tau = max(self.cfg.gain_smoothing_tau_s, 1e-4)
         alpha = 1.0 - math.exp(-(frames / self.cfg.sample_rate) / tau)

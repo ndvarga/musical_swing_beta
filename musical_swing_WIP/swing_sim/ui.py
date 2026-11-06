@@ -23,8 +23,8 @@ from .api_server import (
     start_api_server_thread,
     TelemetryHub,
     TelemetrySnapshot,
-    SpeakerManager,
 )
+from .speaker import SpeakerManager
 
 
 # ---------------------------
@@ -165,6 +165,7 @@ class AppRuntime(QtCore.QObject):
 
     def set_paused(self, paused: bool) -> None:
         self._paused = bool(paused)
+        self.audio.set_fault_mute("paused", self._paused)
 
     def reset(self) -> None:
         # No simulated physics state to reset with real hardware -- this
@@ -241,7 +242,6 @@ class AppRuntime(QtCore.QObject):
         self.ui_fps_est = self._fps_smooth
 
         if self._paused:
-            self.audio.set_safe_mute(True)
             return
 
         sample = self.imu_hw.get_latest()
@@ -249,11 +249,11 @@ class AppRuntime(QtCore.QObject):
         if stale:
             # Fail-safe: a lost/disconnected sensor mutes rather than lets
             # audio keep playing whatever gain was last computed.
-            self.audio.set_safe_mute(True)
+            self.audio.set_fault_mute("imu", True)
             self.status = "Waiting for first IMU sample..." if sample is None else "IMU signal lost -- audio muted"
             return
 
-        self.audio.set_safe_mute(self.cfg.audio.safe_mute)
+        self.audio.set_fault_mute("imu", False)
 
         raw_feature = self.imu_hw.raw_feature_from(sample)
         t_now = sample.t
@@ -761,7 +761,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Status labels
         self.status_label.setText(f"Status: {self.rt.status}  |  x={self.rt.x_norm:.3f}")
-        self.audio_label.setText(f"Audio: {self.rt.audio.status.message}  |  gains={tuple(round(g,3) for g in self.rt.gains)}")
+        muted = self.rt.audio.mute_reasons()
+        mute_text = f"  |  muted: {', '.join(muted)}" if muted else ""
+        self.audio_label.setText(f"Audio: {self.rt.audio.status.message}{mute_text}  |  gains={tuple(round(g,3) for g in self.rt.gains)}")
         self.timing_label.setText(f"Timing: UI fps~{self.rt.ui_fps_est:.1f} | last frame dt={self.rt.last_dt_wall*1000:.1f} ms")
 
         # If calibration finished, show it
