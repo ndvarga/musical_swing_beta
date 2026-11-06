@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict, field
-from typing import Literal, Dict, Any
+from dataclasses import dataclass, asdict, field, fields
+from typing import Literal, Dict, List, Any, Optional
 import json
 
 
@@ -81,10 +81,9 @@ class AudioConfig:
     # Audio fade smoothing inside audio engine (seconds)
     gain_smoothing_tau_s: float = 0.08
 
-    # Placeholder sources (frequencies)
-    f1_hz: float = 220.0
-    f2_hz: float = 440.0
-    f3_hz: float = 660.0
+    library_dir: str = "layers" # folder with layer files
+
+    layer_files: List[Optional[str]] = field(default_factory=lambda: [None, None, None])
 
     noise_level: float = 0.08        # third layer can include noise feel
 
@@ -111,12 +110,21 @@ class AppConfig:
 
     @staticmethod
     def from_json(s: str) -> "AppConfig":
+        """
+        Tolerant of configs saved by older/newer versions: unknown keys
+        (e.g. the old sine engine's f1_hz) are ignored, and missing
+        sections or fields fall back to their defaults.
+        """
         d: Dict[str, Any] = json.loads(s)
         cfg = AppConfig()
-        cfg.physics = PhysicsConfig(**d["physics"])
-        cfg.imu = IMUConfig(**d["imu"])
-        cfg.env = EnvelopeConfig(**d["env"])
-        cfg.ctrl = ControlConfig(**d["ctrl"])
-        cfg.audio = AudioConfig(**d["audio"])
-        cfg.ui = UIConfig(**d["ui"])
+        for f in fields(AppConfig):
+            section = d.get(f.name)
+            if isinstance(section, dict):
+                section_cls = type(getattr(cfg, f.name))
+                setattr(cfg, f.name, section_cls(**_known_fields(section_cls, section)))
         return cfg
+
+
+def _known_fields(cls: type, d: Dict[str, Any]) -> Dict[str, Any]:
+    names = {f.name for f in fields(cls)}
+    return {k: v for k, v in d.items() if k in names}
