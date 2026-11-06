@@ -17,7 +17,6 @@ from .control import IntensityEstimator, Controller
 from .audio import AudioEngine
 from .calibration import CalibrationManager, CalibrationResult
 from .logging_utils import DataLogger
-from .swing_widget import SwingWidget
 # TODO: api servier not implemented
 """from .api_server import (
     create_app,
@@ -56,8 +55,7 @@ class AppRuntime(QtCore.QObject):
         thread, independent of everything below.
       - tick(), called once per Qt UI timer interval (~ui_fps Hz), reads
         whatever the latest IMU sample is and runs exactly one control +
-        audio update per call, using the actually-measured wall-clock dt
-        -- there's no fixed-step simulated loop anymore.
+        audio update per call, using the actually-measured wall-clock dt.
       - A stale IMU sample (sensor lost/disconnected) force-mutes audio
         rather than letting it keep playing a frozen gain.
       - Also starts the local API server (api_server.py) the keeper's
@@ -100,40 +98,26 @@ class AppRuntime(QtCore.QObject):
         self.imu_hw.start()
         self.imu_hw.calibrate_bias(seconds=2.0)  # keep the swing still/hanging during this
 
-        # Vestigial simulator-only controls (impulse slider/dropdown in
-        # MainWindow still read/write these two; nothing acts on them
-        # anymore now that real motion comes from imu_hw.py).
-        self.impulse_strength = 1.2
-        self.impulse_mode = "assist"
-
         # Recording
         self.recording = False
 
         # Pause
         self._paused = False
 
-        # Timing bookkeeping. Unlike the simulator, there's no fixed-step
-        # physics loop to catch up on here -- real hardware already runs
-        # in real time. Control now runs once per UI tick, using the
+        # Timing bookkeeping. Control runs once per UI tick, using the
         # actually-measured wall-clock dt each time (see tick()).
         self._last_wall = time.perf_counter()
         self._stale_timeout_s = 1.5  # force-mute if the IMU goes silent this long
         self.last_t = 0.0  # most recent real IMU sample's timestamp; calibration buttons read this
 
-        self.control_hz = cfg.ui.ui_fps  # control now runs at the UI tick rate, not a fixed 200 Hz
+        self.control_hz = cfg.ui.ui_fps  # control runs at the UI tick rate
 
         # Debug/timing
         self.last_dt_wall = 0.0
         self.ui_fps_est = 0.0
         self._fps_smooth = 0.0
 
-        # Exported state (for UI). theta/omega have no real equivalent
-        # with a gyro-only IMU -- getting an absolute angle would need
-        # sensor fusion with the accelerometer, which this doesn't do --
-        # so they stay at 0 and the on-screen pendulum just sits still
-        # rather than drift from integrating noisy gyro data alone.
-        self.theta = 0.0
-        self.omega = 0.0
+        # Exported state (for UI)
         self.gyro_y = 0.0
 
         self.raw_feature = 0.0
@@ -173,30 +157,13 @@ class AppRuntime(QtCore.QObject):
         self.audio.set_fault_mute("paused", self._paused)
 
     def reset(self) -> None:
-        # No simulated physics state to reset with real hardware -- this
-        # now just clears the controller/estimator back to baseline.
+        # Clears the controller/estimator back to baseline.
         self.controller.reset()
         self.estimator.state.envelope = 0.0
         self.estimator.state.x_norm = 0.0
 
     def set_mode(self, mode: str) -> None:
         self.cfg.ctrl.mode = "single" if mode == "single" else "layered"
-
-    def set_seed(self, seed: int) -> None:
-        # Seeded randomness was a simulator-only concept (reproducible
-        # fake wind/sensor noise). Left as a harmless no-op, since the
-        # existing seed control in the UI still calls this -- safe to
-        # remove that control later.
-        self.cfg.physics.seed = int(seed)
-
-    def set_drag_theta(self, theta: float) -> None:
-        pass  # drag-to-swing was a simulator-only interaction; no real-hardware equivalent
-
-    def set_dragging(self, dragging: bool) -> None:
-        pass  # see set_drag_theta
-
-    def apply_impulse(self) -> None:
-        pass  # "kick the swing" was a simulator-only interaction; no real-hardware equivalent
 
     def update_parameters(self) -> None:
         """
@@ -205,9 +172,6 @@ class AppRuntime(QtCore.QObject):
         """
         self.controller.cfg = self.cfg.ctrl
         self.estimator.cfg = self.cfg.env
-        # physics/imu config sync removed -- cfg.physics and cfg.imu now
-        # only matter to the simulator path used by tests.py, not live
-        # hardware.
 
         self.audio.set_master_cap(self.cfg.ctrl.master_cap)
         self.audio.set_safe_mute(self.cfg.audio.safe_mute)
@@ -226,12 +190,9 @@ class AppRuntime(QtCore.QObject):
 
     def tick(self) -> None:
         """
-        Called by UI timer. Reads the latest real IMU sample and runs one
-        control/audio update. Unlike the simulator, real hardware already
-        advances in real time on its own background thread (imu_hw.py),
-        so there's no fixed-step catch-up loop here -- control simply
-        runs once per UI tick, using the actually-measured wall-clock dt
-        (dt_wall) as the time step, rather than a fixed simulated one.
+        Called by UI timer. Reads the latest IMU sample (imu_hw.py samples
+        on its own background thread) and runs one control/audio update,
+        using the actually-measured wall-clock dt (dt_wall) as the time step.
         """
         now = time.perf_counter()
         dt_wall = now - self._last_wall
@@ -277,7 +238,7 @@ class AppRuntime(QtCore.QObject):
         self.envelope = env_state.envelope
         self.x_norm = env_state.x_norm
 
-        out = self.controller.update(self.x_norm, dt_wall, wind_on=False)
+        out = self.controller.update(self.x_norm, dt_wall)
         self.gains = out.gains
         self.status = out.status
         self.chatter = out.chatter_flag
@@ -318,9 +279,6 @@ class AppRuntime(QtCore.QObject):
             self.logger.log_row({
                 "t": t_now,
                 "mode": self.cfg.ctrl.mode,
-                "wind_on": False,
-                "theta": self.theta,
-                "omega": self.omega,
                 "gyro_y": self.gyro_y,
                 "raw_feature": self.raw_feature,
                 "envelope": self.envelope,
@@ -342,19 +300,18 @@ class AppRuntime(QtCore.QObject):
 class MainWindow(QtWidgets.QMainWindow):
     """
     Full UI panels:
-      - Controls: mode, wind, pause/reset, impulse, damping/length
+      - Controls: mode, pause/reset
       - Envelope: attack/release, thresholds, hysteresis, dwell, master cap, safe mute
-      - Sensor realism: spikes/dropouts, seed
       - Calibration helper: baseline capture, active capture, apply/cancel
       - Recording: CSV toggle
       - Config export/import
-      - Tabs: Swing view and Envelope visualization + layer timeline
-      - Keyboard shortcuts: Space=pause/resume, R=reset, I=impulse, W=toggle wind
+      - Tabs: Envelope visualization + layer timeline
+      - Keyboard shortcuts: Space=pause/resume, R=reset
     """
 
     def __init__(self, cfg: AppConfig):
         super().__init__()
-        self.setWindowTitle("Musical Swing Simulator (Local)")
+        self.setWindowTitle("Musical Swing")
         self.cfg = cfg
         self.rt = AppRuntime(cfg)
 
@@ -393,16 +350,6 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.setStretchFactor(0, 0)  # left (scroll) stays reasonable
         splitter.setStretchFactor(1, 1)  # right expands/contracts more
 
-
-        # --- Swing tab ---
-        swing_tab = QtWidgets.QWidget()
-        swing_layout = QtWidgets.QVBoxLayout(swing_tab)
-        self.swing_widget = SwingWidget()
-        swing_layout.addWidget(self.swing_widget)
-        right.addTab(swing_tab, "Swing")
-
-        self.swing_widget.thetaChanged.connect(self._on_drag_theta)
-        self.swing_widget.dragStateChanged.connect(self._on_drag_state)
 
         # --- Envelope tab ---
         env_tab = QtWidgets.QWidget()
@@ -488,14 +435,6 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.mode_combo, row, 1)
         row += 1
 
-        # Wind
-        self.wind_check = QtWidgets.QCheckBox("Wind mode")
-        self.wind_check.setChecked(self.cfg.physics.wind_enabled)
-        self.wind_check.stateChanged.connect(lambda s: self._set_wind(bool(s)))
-        self.wind_check.setToolTip("Adds small perturbations. Default thresholds should remain quiet in wind-only.")
-        layout.addWidget(self.wind_check, row, 0, 1, 2)
-        row += 1
-
         # Pause / Reset
         self.pause_btn = QtWidgets.QPushButton("Pause (Space)")
         self.pause_btn.clicked.connect(self._toggle_pause)
@@ -503,55 +442,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reset_btn.clicked.connect(self._reset)
         layout.addWidget(self.pause_btn, row, 0)
         layout.addWidget(self.reset_btn, row, 1)
-        row += 1
-
-        # Impulse
-        self.impulse_btn = QtWidgets.QPushButton("Impulse / Actuate (I)")
-        self.impulse_btn.clicked.connect(self._impulse)
-        self.impulse_btn.setToolTip("Injects energy by changing omega instantly (delta-omega).")
-        layout.addWidget(self.impulse_btn, row, 0, 1, 2)
-        row += 1
-
-        # Impulse strength
-        layout.addWidget(QtWidgets.QLabel("Impulse strength:"), row, 0)
-        self.impulse_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.impulse_slider.setRange(1, 400)
-        self.impulse_slider.setValue(int(self.rt.impulse_strength * 100))
-        self.impulse_slider.valueChanged.connect(self._impulse_strength_changed)
-        self.impulse_slider.setToolTip("Scales how much omega increases per impulse.")
-        layout.addWidget(self.impulse_slider, row, 1)
-        row += 1
-
-        # Impulse direction
-        layout.addWidget(QtWidgets.QLabel("Impulse direction:"), row, 0)
-        self.impulse_dir = QtWidgets.QComboBox()
-        self.impulse_dir.addItems(["assist", "positive", "negative"])
-        self.impulse_dir.setCurrentText(self.rt.impulse_mode)
-        self.impulse_dir.currentTextChanged.connect(self._impulse_dir_changed)
-        self.impulse_dir.setToolTip("assist: push along current motion; positive/negative: fixed direction.")
-        layout.addWidget(self.impulse_dir, row, 1)
-        row += 1
-
-        # Damping
-        layout.addWidget(QtWidgets.QLabel("Damping:"), row, 0)
-        self.damping_spin = QtWidgets.QDoubleSpinBox()
-        self.damping_spin.setRange(0.0, 2.0)
-        self.damping_spin.setSingleStep(0.02)
-        self.damping_spin.setValue(self.cfg.physics.damping)
-        self.damping_spin.valueChanged.connect(self._damping_changed)
-        self.damping_spin.setToolTip("Higher damping -> swing dies out faster.")
-        layout.addWidget(self.damping_spin, row, 1)
-        row += 1
-
-        # Length
-        layout.addWidget(QtWidgets.QLabel("Length (m):"), row, 0)
-        self.length_spin = QtWidgets.QDoubleSpinBox()
-        self.length_spin.setRange(0.3, 4.0)
-        self.length_spin.setSingleStep(0.05)
-        self.length_spin.setValue(self.cfg.physics.length_m)
-        self.length_spin.valueChanged.connect(self._length_changed)
-        self.length_spin.setToolTip("Longer length -> slower natural period.")
-        layout.addWidget(self.length_spin, row, 1)
         row += 1
 
         return g
@@ -641,30 +531,6 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.safe_mute, row, 0, 1, 2)
         row += 1
 
-        # Seed (deterministic wind + sensor noise)
-        layout.addWidget(QtWidgets.QLabel("Seed:"), row, 0)
-        self.seed_spin = QtWidgets.QSpinBox()
-        self.seed_spin.setRange(0, 999999999)
-        self.seed_spin.setValue(self.cfg.physics.seed)
-        self.seed_spin.valueChanged.connect(self._seed_changed)
-        self.seed_spin.setToolTip("Deterministic seed for repeatable wind + noise patterns.")
-        layout.addWidget(self.seed_spin, row, 1)
-        row += 1
-
-        # Sensor realism toggles
-        self.spikes_check = QtWidgets.QCheckBox("Sensor spikes")
-        self.spikes_check.setChecked(self.cfg.imu.spikes_enabled)
-        self.spikes_check.stateChanged.connect(lambda s: self._spikes_changed(bool(s)))
-        self.spikes_check.setToolTip("Inject occasional gyro spikes to test robustness.")
-        layout.addWidget(self.spikes_check, row, 0)
-
-        self.drop_check = QtWidgets.QCheckBox("Sensor dropouts")
-        self.drop_check.setChecked(self.cfg.imu.dropouts_enabled)
-        self.drop_check.stateChanged.connect(lambda s: self._dropouts_changed(bool(s)))
-        self.drop_check.setToolTip("Inject occasional missing samples (NaNs).")
-        layout.addWidget(self.drop_check, row, 1)
-        row += 1
-
         return g
 
     def _panel_calibration(self) -> QtWidgets.QGroupBox:
@@ -721,7 +587,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.rec_check = QtWidgets.QCheckBox("Record CSV time series to ./logs/")
         self.rec_check.stateChanged.connect(lambda s: self._toggle_recording(bool(s)))
-        self.rec_check.setToolTip("Logs theta/omega/gyro/envelope/x/gains/state at control rate.")
+        self.rec_check.setToolTip("Logs gyro feature/envelope/x/gains/state at control rate.")
         layout.addWidget(self.rec_check)
 
         return g
@@ -758,9 +624,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_timer(self) -> None:
         self.rt.update_parameters()
         self.rt.tick()
-
-        # Update swing view
-        self.swing_widget.set_state(self.rt.theta, self.rt.omega)
 
         # Update plots
         self._update_plots()
@@ -823,16 +686,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cur_l3.setData(tt, l3)
 
     # ---------------------------
-    # Callbacks: swing interaction
-    # ---------------------------
-
-    def _on_drag_theta(self, theta: float) -> None:
-        self.rt.set_drag_theta(theta)
-
-    def _on_drag_state(self, dragging: bool) -> None:
-        self.rt.set_dragging(dragging)
-
-    # ---------------------------
     # Callbacks: controls
     # ---------------------------
 
@@ -840,30 +693,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cfg.ctrl.mode = mode
         self.rt.set_mode(mode)
 
-    def _set_wind(self, on: bool) -> None:
-        self.cfg.physics.wind_enabled = bool(on)
-
     def _toggle_pause(self) -> None:
         self.rt.set_paused(not self.rt.paused)
         self.pause_btn.setText("Resume (Space)" if self.rt.paused else "Pause (Space)")
 
     def _reset(self) -> None:
         self.rt.reset()
-
-    def _impulse(self) -> None:
-        self.rt.apply_impulse()
-
-    def _impulse_strength_changed(self, v: int) -> None:
-        self.rt.impulse_strength = v / 100.0
-
-    def _impulse_dir_changed(self, s: str) -> None:
-        self.rt.impulse_mode = s
-
-    def _damping_changed(self, v: float) -> None:
-        self.cfg.physics.damping = float(v)
-
-    def _length_changed(self, v: float) -> None:
-        self.cfg.physics.length_m = float(v)
 
     def _attack_changed(self, v: float) -> None:
         self.cfg.env.attack_tau_s = float(v)
@@ -894,16 +729,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _safe_mute_changed(self, on: bool) -> None:
         self.cfg.audio.safe_mute = bool(on)
-
-    def _seed_changed(self, v: int) -> None:
-        self.cfg.physics.seed = int(v)
-        self.rt.set_seed(int(v))
-
-    def _spikes_changed(self, on: bool) -> None:
-        self.cfg.imu.spikes_enabled = bool(on)
-
-    def _dropouts_changed(self, on: bool) -> None:
-        self.cfg.imu.dropouts_enabled = bool(on)
 
     def _toggle_recording(self, on: bool) -> None:
         if on:
@@ -991,9 +816,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Update visible controls
         self.mode_combo.setCurrentText(cfg2.ctrl.mode)
-        self.wind_check.setChecked(cfg2.physics.wind_enabled)
-        self.damping_spin.setValue(cfg2.physics.damping)
-        self.length_spin.setValue(cfg2.physics.length_m)
 
         self.attack_spin.setValue(cfg2.env.attack_tau_s)
         self.release_spin.setValue(cfg2.env.release_tau_s)
@@ -1008,13 +830,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cap_spin.setValue(cfg2.ctrl.master_cap)
         self.safe_mute.setChecked(cfg2.audio.safe_mute)
 
-        self.seed_spin.setValue(cfg2.physics.seed)
-        self.spikes_check.setChecked(cfg2.imu.spikes_enabled)
-        self.drop_check.setChecked(cfg2.imu.dropouts_enabled)
-
-        # Ensure deterministic seed is applied to sim
-        self.rt.set_seed(cfg2.physics.seed)
-
     # ---------------------------
     # Keyboard shortcuts
     # ---------------------------
@@ -1025,10 +840,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._toggle_pause()
         elif key == QtCore.Qt.Key_R:
             self._reset()
-        elif key == QtCore.Qt.Key_I:
-            self._impulse()
-        elif key == QtCore.Qt.Key_W:
-            self.wind_check.setChecked(not self.wind_check.isChecked())
         else:
             super().keyPressEvent(event)
 

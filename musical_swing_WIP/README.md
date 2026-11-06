@@ -1,4 +1,4 @@
-# Musical Swing Simulator (Local, Offline)
+# Musical Swing (Raspberry Pi, real hardware)
 
 ## Run (macOS)
 ```bash

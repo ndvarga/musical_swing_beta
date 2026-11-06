@@ -20,7 +20,7 @@ class DataLogger:
         self._fp = open(path, "w", newline="")
         self._writer = csv.writer(self._fp)
         self._writer.writerow([
-            "t","mode","wind_on","theta","omega","gyro_y",
+            "t","mode","gyro_y",
             "raw_feature","envelope","x_norm","gain1","gain2","gain3",
             "master_cap","quiet","status","calibration_state"
         ])
@@ -36,9 +36,6 @@ class DataLogger:
         self._writer.writerow([
             row.get("t", 0.0),
             row.get("mode", ""),
-            int(bool(row.get("wind_on", False))),
-            row.get("theta", 0.0),
-            row.get("omega", 0.0),
             row.get("gyro_y", 0.0),
             row.get("raw_feature", 0.0),
             row.get("envelope", 0.0),

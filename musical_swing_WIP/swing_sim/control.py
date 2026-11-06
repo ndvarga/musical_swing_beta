@@ -123,7 +123,7 @@ class Controller:
         self._transition_times = [tt for tt in self._transition_times if (self._t - tt) <= window_s]
         return len(self._transition_times) >= 10
 
-    def update(self, x: float, dt: float, wind_on: bool) -> ControlOutput:
+    def update(self, x: float, dt: float) -> ControlOutput:
         self._t += dt
         quiet = self.cfg.quiet_below_T1 and x < self.cfg.T1
 
@@ -131,8 +131,6 @@ class Controller:
             gain = 0.0 if quiet else self._ramp(x, self.cfg.T1, 1.0)
             chatter = self._chatter_detect()
             status = "Audio muted (below T1)" if quiet else "Single-track active"
-            if wind_on and quiet:
-                status = "Wind-only regime (quiet)"
             if chatter:
                 status += " | Chatter detected"
             return ControlOutput("single", (gain, 0.0, 0.0), self.cfg.master_cap, x, quiet, chatter, status)
@@ -153,8 +151,6 @@ class Controller:
 
         chatter = self._chatter_detect()
         status = "Audio muted (below T1)" if quiet else f"Layered active: {','.join([str(i+1) for i,L in enumerate(self.layers) if L.active]) or 'None'}"
-        if wind_on and quiet:
-            status = "Wind-only regime (quiet)"
         if chatter:
             status += " | Chatter detected"
 

@@ -9,36 +9,6 @@ Mode = Literal["layered", "single"]
 
 
 @dataclass
-class PhysicsConfig:
-    g: float = 9.81
-    length_m: float = 1.2            # effective pendulum length (tunable)
-    damping: float = 0.18            # viscous damping coefficient (tunable)
-    dt_physics: float = 0.001        # 1 kHz physics integration
-
-    # Wind forcing (small torque-like perturbation)
-    wind_enabled: bool = False
-    wind_sine_amp: float = 0.08      # torque amplitude in "rad/s^2-ish" units
-    wind_sine_hz: float = 0.35
-    wind_noise_amp: float = 0.03     # random perturbation amplitude
-    seed: int = 12345                # deterministic when set
-
-
-@dataclass
-class IMUConfig:
-    sample_hz: int = 1000
-    gyro_bias: float = 0.02          # constant bias offset
-    gyro_noise_std: float = 0.03     # Gaussian noise std
-    cross_axis_noise_std: float = 0.005
-
-    spikes_enabled: bool = False
-    spike_prob_per_s: float = 0.2
-    spike_mag: float = 1.5
-
-    dropouts_enabled: bool = False
-    dropout_prob_per_s: float = 0.2
-
-
-@dataclass
 class EnvelopeConfig:
     # Asymmetric EMA time constants (seconds)
     attack_tau_s: float = 0.35
@@ -98,8 +68,6 @@ class UIConfig:
 
 @dataclass
 class AppConfig:
-    physics: PhysicsConfig = field(default_factory=PhysicsConfig)
-    imu: IMUConfig = field(default_factory=IMUConfig)
     env: EnvelopeConfig = field(default_factory=EnvelopeConfig)
     ctrl: ControlConfig = field(default_factory=ControlConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
