@@ -32,6 +32,7 @@ from pydantic import BaseModel
 
 from swing_sim.imu_hw import MPU6050Reader
 from swing_sim.speaker import SpeakerManager
+from swing_sim.audio import AudioEngine, AudioConfig, AudioStatus
 
 try:
     import numpy as np
@@ -159,6 +160,7 @@ class MotionAudio:
     in volume mode, back to the resting pitch in pitch mode.
     """
 
+    # TODO: most of audio is for testing
     SR = 48000
     CHORD_RATIOS = np.array([1.0, 2 ** (4 / 12), 2 ** (7 / 12), 2.0])  # major triad + octave
     ATTACK_S, RELEASE_S = 0.08, 0.6
@@ -284,6 +286,8 @@ app = FastAPI()
 imu = MPU6050Reader(sample_hz=100, feature_mode="magnitude")
 motion = MotionAudio(imu)
 speaker = SpeakerManager(speaker_mac=None, auto_start=False)  # started in __main__
+audio_cfg = AudioConfig()
+audio = AudioEngine(audio_cfg)
 
 INDEX_HTML = Path(__file__).with_name("static") / "index.html"
 
@@ -426,8 +430,40 @@ class MotionSettings(BaseModel):
     mode: Optional[str] = None
 
 
+LAYER_MODE = "layers"  # "Movement -> layers": drives swing_sim/audio.py's AudioEngine layers
+
+
+class LayerChoice(BaseModel):
+    layer: int                  # 0, 1 or 2
+    file: Optional[str] = None  # filename in the library folder; None clears the layer
+
+
+@app.get("/api/layers")
+def get_layers():
+    """
+    TODO: return {"files": [...library filenames...],
+                  "layers": [{"file": name_or_None}, x3]}
+    (AudioEngine.library_files() / current_assignments()).
+    """
+    raise HTTPException(501, "Layer mode isn't implemented yet")
+
+
+@app.post("/api/layers")
+def set_layer(choice: LayerChoice):
+    """
+    TODO: assign choice.file to layer choice.layer (AudioEngine.assign_layer;
+    ValueError/FileNotFoundError -> 400), then return get_layers().
+    """
+    raise HTTPException(501, "Layer mode isn't implemented yet")
+
+
 @app.post("/api/motion")
 def set_motion(s: MotionSettings):
+    if s.mode == LAYER_MODE:
+        # TODO: switch motion audio to the layer engine. While in this mode,
+        # motion.state() should include "mode": "layers" and
+        # "layer_gains": [g0, g1, g2] (0..1) for the page's meters.
+        raise HTTPException(501, "Layer mode isn't implemented yet")
     if s.mode is not None:
         if s.mode not in motion.MODES:
             raise HTTPException(400, f"mode must be one of {motion.MODES}")

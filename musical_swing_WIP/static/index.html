@@ -30,16 +30,21 @@
 <div class="seg" role="radiogroup">
   <button id="mo-mode-volume" data-mode="volume" class="on">Movement &rarr; volume</button>
   <button id="mo-mode-pitch" data-mode="pitch">Movement &rarr; pitch</button>
+  <button id="mo-mode-layers" data-mode="layers">Movement &rarr; layers</button>
 </div>
 <div id="mo-desc" style="color:#aaa;font-size:.9rem;max-width:420px;margin-top:8px"></div>
 <div class="btns"><button id="mo-toggle">Start sound</button></div>
 <div class="meter-row"><span>Gyro speed</span><div class="meter"><div id="mo-rate" style="background:#58a"></div></div><span id="mo-rate-n">0 °/s</span></div>
 <div class="meter-row"><span>Volume</span><div class="meter"><div id="mo-gain"></div></div><span id="mo-gain-n">0%</span></div>
-<div class="meter-row"><span>Pitch now</span><div class="meter"><div id="mo-pitch" style="background:#c8a"></div></div><span id="mo-pitch-n">220 Hz</span></div>
+<div class="meter-row" id="mo-pitch-row"><span>Pitch now</span><div class="meter"><div id="mo-pitch" style="background:#c8a"></div></div><span id="mo-pitch-n">220 Hz</span></div>
 <label style="display:block;margin-top:14px;max-width:420px"><span id="mo-full-label">Full volume</span> at <b id="mo-full-n">150</b> °/s
   <input id="mo-full" type="range" min="20" max="500" step="10" value="150" style="width:100%"></label>
-<label style="display:block;margin-top:14px;max-width:420px"><span id="mo-hz-label">Pitch</span> <b id="mo-hz-n">220 Hz (A3)</b>
+<label id="mo-hz-row" style="display:block;margin-top:14px;max-width:420px"><span id="mo-hz-label">Pitch</span> <b id="mo-hz-n">220 Hz (A3)</b>
   <input id="mo-hz" type="range" min="0" max="1000" value="500" style="width:100%"></label>
+<div id="layers-panel" hidden>
+  <div id="layers-status" style="color:#aaa;font-size:.9rem;margin-top:14px;max-width:420px"></div>
+  <div id="layers-rows"></div>
+</div>
 <div id="mo-msg" class="bad" style="font-size:.9rem;margin-top:6px"></div>
 <style>
   .meter-row { display: flex; align-items: center; gap: 10px; max-width: 420px; margin-top: 12px; }
@@ -50,7 +55,11 @@
   .seg { display: flex; max-width: 420px; margin-top: 10px; }
   .seg button { flex: 1; border-radius: 0; }
   .seg button:first-child { border-radius: 8px 0 0 8px; }
-  .seg button:last-child { border-radius: 0 8px 8px 0; border-left: none; }
+  .seg button:last-child { border-radius: 0 8px 8px 0; }
+  .seg button + button { border-left: none; }
+  .layer-row { max-width: 420px; margin-top: 14px; }
+  .layer-row select { margin-top: 6px; }
+  .layer-row .meter-row { margin-top: 8px; }
   .seg button.on { background: #2d4a2d; border-color: #6c6; color: #fff; }
 </style>
 
@@ -152,12 +161,17 @@ moHz.oninput = () => {
 function renderMotion(m) {
   moEnabled = m.enabled;
   moToggle.textContent = m.enabled ? "Stop sound" : "Start sound";
-  const pitchMode = m.mode === "pitch";
+  const pitchMode = m.mode === "pitch", layersMode = m.mode === "layers";
   document.querySelectorAll(".seg button").forEach(b => b.classList.toggle("on", b.dataset.mode === m.mode));
-  document.getElementById("mo-desc").textContent = pitchMode
+  document.getElementById("mo-desc").textContent = layersMode
+    ? "Plays the three library layers; movement drives each layer's volume."
+    : pitchMode
     ? `Always at full volume. Pitch rises from ${Math.round(m.root_hz)} Hz at rest to ${Math.round(m.top_hz)} Hz (two octaves up) at full speed.`
     : "Pitch stays put. The faster the sensor turns, the louder it gets; silent at rest.";
-  document.getElementById("mo-full-label").textContent = pitchMode ? "Highest pitch" : "Full volume";
+  document.getElementById("mo-full-label").textContent = pitchMode ? "Highest pitch" : layersMode ? "All layers full" : "Full volume";
+  document.getElementById("mo-pitch-row").hidden = document.getElementById("mo-hz-row").hidden = layersMode;
+  setLayersVisible(layersMode);
+  if (m.layer_gains) renderLayerGains(m.layer_gains);
   document.getElementById("mo-hz-label").textContent = pitchMode ? "Resting pitch" : "Pitch";
   document.getElementById("mo-gain").style.width = (m.gain * 100) + "%";
   document.getElementById("mo-gain-n").textContent = Math.round(m.gain * 100) + "%";
@@ -174,6 +188,69 @@ function renderMotion(m) {
     rootHz = m.root_hz; moHz.value = hzToSlider(rootHz);
     document.getElementById("mo-hz-n").textContent = hzLabel(rootHz);
   }
+}
+
+// "Movement -> layers" mode: the three looping clips from the layers/ folder
+// (swing_sim/audio.py AudioEngine). Expects these endpoints on the Pi:
+//   GET  /api/layers  -> {files: ["riser.wav", ...],          files in the library folder
+//                         layers: [{file: str|null}, x3]}     current clip per layer
+//   POST /api/layers  {layer: 0-2, file: str|null}  assign/clear one layer; returns same as GET
+//   POST /api/motion  {mode: "layers"}  switch to layer mode (existing endpoint, new mode)
+// Live per-layer volumes come over the WebSocket as motion.layer_gains: [g0, g1, g2] (0..1).
+// Errors use FastAPI's {detail: "..."} like the other endpoints.
+const layersPanel = document.getElementById("layers-panel"), layersRows = document.getElementById("layers-rows");
+const layersStatus = document.getElementById("layers-status");
+const LAYER_COUNT = 3;
+
+function buildLayerRows() {
+  for (let i = 0; i < LAYER_COUNT; i++) {
+    const row = document.createElement("div");
+    row.className = "layer-row";
+    row.innerHTML = `<div>Layer ${i + 1}</div>
+      <select id="layer-file-${i}"><option value="">(none)</option></select>
+      <div class="meter-row"><span>Volume</span><div class="meter"><div id="layer-gain-${i}"></div></div>
+      <span id="layer-gain-n-${i}">0%</span></div>`;
+    layersRows.appendChild(row);
+    row.querySelector("select").onchange = e => setLayer(i, e.target.value || null);
+  }
+}
+buildLayerRows();
+
+function renderLayers(j) {
+  layersStatus.textContent = ""; layersStatus.className = "";
+  for (let i = 0; i < LAYER_COUNT; i++) {
+    const sel = document.getElementById(`layer-file-${i}`);
+    if (document.activeElement === sel) continue;
+    sel.innerHTML = "<option value=''>(none)</option>";
+    (j.files || []).forEach(f => sel.add(new Option(f, f)));
+    sel.value = (j.layers && j.layers[i] && j.layers[i].file) || "";
+  }
+}
+
+function renderLayerGains(gains) {
+  gains.slice(0, LAYER_COUNT).forEach((g, i) => {
+    document.getElementById(`layer-gain-${i}`).style.width = (g * 100) + "%";
+    document.getElementById(`layer-gain-n-${i}`).textContent = Math.round(g * 100) + "%";
+  });
+}
+
+async function loadLayers() {
+  layersStatus.textContent = "Loading layers..."; layersStatus.className = "";
+  try { renderLayers(await api("/api/layers")); }
+  catch (e) { layersStatus.textContent = "Layers: " + e.message; layersStatus.className = "bad"; }
+}
+
+async function setLayer(i, file) {
+  layersStatus.textContent = `Loading ${file || "(none)"} into layer ${i + 1}...`; layersStatus.className = "";
+  try { renderLayers(await api("/api/layers", {layer: i, file})); }
+  catch (e) { layersStatus.textContent = "Layers: " + e.message; layersStatus.className = "bad"; loadLayers(); }
+}
+
+let layersShown = false;
+function setLayersVisible(show) {
+  layersPanel.hidden = !show;
+  if (show && !layersShown) loadLayers();  // refresh the file list each time the mode is entered
+  layersShown = show;
 }
 
 const spkStatus = document.getElementById("spk-status");

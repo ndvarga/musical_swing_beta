@@ -221,7 +221,7 @@ class SpeakerManager:
             return False
         return True
 
-    def _bt(self, *args: str, timeout: Optional[float]) -> Tuple[bool, str]:
+    def _bt(self, *args: str, timeout: Optional[float]=None) -> Tuple[bool, str]:
         """Runs one bluetoothctl command. Returns (ok, full combined output)."""
         with self._bt_lock:
             try:
