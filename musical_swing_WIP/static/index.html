@@ -29,18 +29,14 @@
 <h1 style="margin-top:32px">Motion audio</h1>
 <div class="seg" role="radiogroup">
   <button id="mo-mode-volume" data-mode="volume" class="on">Movement &rarr; volume</button>
-  <button id="mo-mode-pitch" data-mode="pitch">Movement &rarr; pitch</button>
   <button id="mo-mode-layers" data-mode="layers">Movement &rarr; layers</button>
 </div>
 <div id="mo-desc" style="color:#aaa;font-size:.9rem;max-width:420px;margin-top:8px"></div>
 <div class="btns"><button id="mo-toggle">Start sound</button></div>
 <div class="meter-row"><span>Gyro speed</span><div class="meter"><div id="mo-rate" style="background:#58a"></div></div><span id="mo-rate-n">0 °/s</span></div>
 <div class="meter-row"><span>Volume</span><div class="meter"><div id="mo-gain"></div></div><span id="mo-gain-n">0%</span></div>
-<div class="meter-row" id="mo-pitch-row"><span>Pitch now</span><div class="meter"><div id="mo-pitch" style="background:#c8a"></div></div><span id="mo-pitch-n">220 Hz</span></div>
 <label style="display:block;margin-top:14px;max-width:420px"><span id="mo-full-label">Full volume</span> at <b id="mo-full-n">150</b> °/s
   <input id="mo-full" type="range" min="20" max="500" step="10" value="150" style="width:100%"></label>
-<label id="mo-hz-row" style="display:block;margin-top:14px;max-width:420px"><span id="mo-hz-label">Pitch</span> <b id="mo-hz-n">220 Hz (A3)</b>
-  <input id="mo-hz" type="range" min="0" max="1000" value="500" style="width:100%"></label>
 <div id="layers-panel" hidden>
   <div id="layers-status" style="color:#aaa;font-size:.9rem;margin-top:14px;max-width:420px"></div>
   <div id="layers-rows"></div>
@@ -139,54 +135,24 @@ document.querySelectorAll(".seg button").forEach(b => b.onclick = () => setMotio
 moFull.oninput = () => document.getElementById("mo-full-n").textContent = moFull.value;
 moFull.onchange = () => setMotion({full_dps: Number(moFull.value)});
 
-// Pitch slider is logarithmic (each step is the same musical interval), 55-880 Hz = A1..A5.
-const moHz = document.getElementById("mo-hz"), HZ_LO = 55, HZ_HI = 880;
-const sliderToHz = v => HZ_LO * Math.pow(HZ_HI / HZ_LO, v / 1000);
-const hzToSlider = hz => 1000 * Math.log(hz / HZ_LO) / Math.log(HZ_HI / HZ_LO);
-const NOTES = ["A", "A#", "B", "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#"];
-function hzLabel(hz) {
-  const semis = Math.round(12 * Math.log2(hz / 440));            // from A4
-  const name = NOTES[((semis % 12) + 12) % 12];
-  const octave = 4 + Math.floor((semis + 9) / 12);              // octaves start at C
-  return `${Math.round(hz)} Hz (≈${name}${octave})`;
-}
-let rootHz = 220, hzTimer = null;
-moHz.oninput = () => {
-  const hz = sliderToHz(Number(moHz.value));
-  document.getElementById("mo-hz-n").textContent = hzLabel(hz);
-  clearTimeout(hzTimer);  // send while dragging (throttled), so you hear it slide
-  hzTimer = setTimeout(() => setMotion({root_hz: hz}), 60);
-};
-
 function renderMotion(m) {
   moEnabled = m.enabled;
   moToggle.textContent = m.enabled ? "Stop sound" : "Start sound";
-  const pitchMode = m.mode === "pitch", layersMode = m.mode === "layers";
+  const layersMode = m.mode === "layers";
   document.querySelectorAll(".seg button").forEach(b => b.classList.toggle("on", b.dataset.mode === m.mode));
   document.getElementById("mo-desc").textContent = layersMode
     ? "Plays the three library layers; movement drives each layer's volume."
-    : pitchMode
-    ? `Always at full volume. Pitch rises from ${Math.round(m.root_hz)} Hz at rest to ${Math.round(m.top_hz)} Hz (two octaves up) at full speed.`
-    : "Pitch stays put. The faster the sensor turns, the louder it gets; silent at rest.";
-  document.getElementById("mo-full-label").textContent = pitchMode ? "Highest pitch" : layersMode ? "All layers full" : "Full volume";
-  document.getElementById("mo-pitch-row").hidden = document.getElementById("mo-hz-row").hidden = layersMode;
+    : "The faster the sensor turns, the louder it gets; silent at rest.";
+  document.getElementById("mo-full-label").textContent = layersMode ? "All layers full" : "Full volume";
   setLayersVisible(layersMode);
   if (m.layer_gains) renderLayerGains(m.layer_gains);
-  document.getElementById("mo-hz-label").textContent = pitchMode ? "Resting pitch" : "Pitch";
   document.getElementById("mo-gain").style.width = (m.gain * 100) + "%";
   document.getElementById("mo-gain-n").textContent = Math.round(m.gain * 100) + "%";
-  const pitchFrac = Math.log(m.playing_hz / m.root_hz) / Math.log(m.top_hz / m.root_hz);
-  document.getElementById("mo-pitch").style.width = Math.max(0, Math.min(1, pitchFrac)) * 100 + "%";
-  document.getElementById("mo-pitch-n").textContent = Math.round(m.playing_hz) + " Hz";
   document.getElementById("mo-rate").style.width = Math.min(100, m.rate_dps / m.full_dps * 100) + "%";
   document.getElementById("mo-rate-n").textContent = Math.round(m.rate_dps) + " °/s";
   if (document.activeElement !== moFull && m.full_dps !== fullDps) {
     fullDps = m.full_dps; moFull.value = fullDps;
     document.getElementById("mo-full-n").textContent = Math.round(fullDps);
-  }
-  if (document.activeElement !== moHz && m.root_hz !== rootHz) {
-    rootHz = m.root_hz; moHz.value = hzToSlider(rootHz);
-    document.getElementById("mo-hz-n").textContent = hzLabel(rootHz);
   }
 }
 

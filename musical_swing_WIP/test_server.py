@@ -150,48 +150,33 @@ class MotionAudio:
     turning speed becomes a motion amount from 0 (below dead_dps: sensor
     noise/offset at rest) to 1 (full_dps and above), smoothed with a quick
     attack and slow release so it swells with motion rather than flickering.
+    Volume = motion amount; the chord's pitch is fixed at ROOT_HZ.
 
-    Two modes:
-      "volume": volume = motion amount, pitch fixed at root_hz.
-      "pitch":  volume fixed at 100%, pitch rises from root_hz (at rest)
-                up to PITCH_RANGE_OCT octaves higher (at full_dps).
-
-    If the sensor stops delivering, the motion amount drops to 0: silence
-    in volume mode, back to the resting pitch in pitch mode.
+    If the sensor stops delivering, the motion amount drops to 0: silence.
     """
 
     # TODO: most of audio is for testing
     SR = 48000
     CHORD_RATIOS = np.array([1.0, 2 ** (4 / 12), 2 ** (7 / 12), 2.0])  # major triad + octave
+    ROOT_HZ = 220.0  # chord root (A3)
     ATTACK_S, RELEASE_S = 0.08, 0.6
-    GLIDE_S = 0.05  # pitch changes slide over ~50 ms instead of jumping
-    GAIN_SMOOTH_S = 0.03  # smooths the jump in volume when switching modes
-    MIN_HZ, MAX_HZ = 40.0, 2000.0
-    PITCH_RANGE_OCT = 2.0
-    MODES = ("volume", "pitch")
+    MODES = ("volume",)
 
     def __init__(self, imu: MPU6050Reader):
         self.imu = imu
         self.mode = "volume"
         self.dead_dps = 8.0
         self.full_dps = 150.0
-        self.root_hz = 220.0     # chord root (A3) -- the resting pitch in pitch mode
         self.stream = None
         self.device = None
         self.level = 0.0         # smoothed motion amount 0..1, owned by the audio callback
         self.gain = 0.0          # output volume 0..1, owned by the audio callback
         self.rate_dps = 0.0      # latest gyro speed, for the page
-        self._root_now = self.root_hz  # current (gliding) pitch, owned by the callback
         self._phase = np.zeros(len(self.CHORD_RATIOS))
 
     @property
     def running(self) -> bool:
         return self.stream is not None
-
-    def target_hz(self, level: float) -> float:
-        if self.mode == "pitch":
-            return self.root_hz * 2 ** (self.PITCH_RANGE_OCT * level)
-        return self.root_hz
 
     def motion_amount(self) -> float:
         sample = self.imu.get_latest()
@@ -208,19 +193,14 @@ class MotionAudio:
         tau = self.ATTACK_S if target > self.level else self.RELEASE_S
         self.level += (target - self.level) * (1 - np.exp(-dt / tau))
 
-        g0 = self.gain
-        want_gain = self.level if self.mode == "volume" else 1.0
-        g1 = g0 + (want_gain - g0) * (1 - np.exp(-dt / self.GAIN_SMOOTH_S))
+        g0, g1 = self.gain, self.level
         self.gain = g1
 
-        r0 = self._root_now
-        r1 = r0 + (self.target_hz(self.level) - r0) * (1 - np.exp(-dt / self.GLIDE_S))
-        self._root_now = r1
-        # Per-sample phase steps, so a pitch change is continuous (no clicks).
-        steps = 2 * np.pi * np.outer(self.CHORD_RATIOS, np.linspace(r0, r1, frames)) / self.SR
-        phases = self._phase[:, None] + np.cumsum(steps, axis=1) - steps
+        # Phase carried across blocks, so the tone is continuous (no clicks).
+        steps = 2 * np.pi * self.ROOT_HZ * self.CHORD_RATIOS / self.SR
+        phases = self._phase[:, None] + np.outer(steps, np.arange(frames))
         tone = np.sin(phases).sum(axis=0) / len(self.CHORD_RATIOS)
-        self._phase = (phases[:, -1] + steps[:, -1]) % (2 * np.pi)
+        self._phase = (self._phase + steps * frames) % (2 * np.pi)
         ramp = np.linspace(g0, g1, frames, endpoint=False)  # no zipper noise between blocks
         outdata[:, 0] = (0.35 * ramp * tone).astype(np.float32)
 
@@ -244,15 +224,11 @@ class MotionAudio:
             self.stream.close()
             self.stream = None
         self.gain = self.level = 0.0  # next start fades in from silence
-        self._root_now = self.root_hz
 
     def state(self) -> dict:
-        playing_hz = self._root_now if self.running else self.target_hz(self.level)
         return {"enabled": self.running, "mode": self.mode,
                 "gain": round(self.gain, 3), "level": round(self.level, 3),
                 "rate_dps": round(self.rate_dps, 1), "full_dps": self.full_dps,
-                "root_hz": round(self.root_hz, 2), "playing_hz": round(playing_hz, 1),
-                "top_hz": round(self.root_hz * 2 ** self.PITCH_RANGE_OCT, 1),
                 "device": self.device}
 
 
@@ -426,7 +402,6 @@ def calibrate_imu(s: Optional[CalibrateSettings] = None):
 class MotionSettings(BaseModel):
     enabled: Optional[bool] = None
     full_dps: Optional[float] = None
-    root_hz: Optional[float] = None
     mode: Optional[str] = None
 
 
@@ -470,8 +445,6 @@ def set_motion(s: MotionSettings):
         motion.mode = s.mode
     if s.full_dps is not None:
         motion.full_dps = min(1000.0, max(motion.dead_dps + 5, s.full_dps))
-    if s.root_hz is not None:
-        motion.root_hz = min(motion.MAX_HZ, max(motion.MIN_HZ, s.root_hz))
     try:
         if s.enabled is True:
             motion.start()
