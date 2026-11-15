@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Literal, Dict, Any
 import json
 
@@ -99,12 +99,12 @@ class UIConfig:
 
 @dataclass
 class AppConfig:
-    physics: PhysicsConfig = PhysicsConfig()
-    imu: IMUConfig = IMUConfig()
-    env: EnvelopeConfig = EnvelopeConfig()
-    ctrl: ControlConfig = ControlConfig()
-    audio: AudioConfig = AudioConfig()
-    ui: UIConfig = UIConfig()
+    physics: PhysicsConfig = field(default_factory=PhysicsConfig)
+    imu: IMUConfig = field(default_factory=IMUConfig)
+    env: EnvelopeConfig = field(default_factory=EnvelopeConfig)
+    ctrl: ControlConfig = field(default_factory=ControlConfig)
+    audio: AudioConfig = field(default_factory=AudioConfig)
+    ui: UIConfig = field(default_factory=UIConfig)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
