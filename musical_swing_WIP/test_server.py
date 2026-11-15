@@ -13,6 +13,10 @@ it's reconnected on the next start too.
     python test_server.py --speaker XX:XX:XX:XX:XX:XX
 """
 
+# TODO: for Rhyme: add a help with definitions of confusing things?
+# For example, I think the layer ramp up and ramp down times should be configurable,
+# but need to be explained
+
 import subprocess
 import shutil
 import argparse
