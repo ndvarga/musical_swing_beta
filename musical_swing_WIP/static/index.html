@@ -1,0 +1,325 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pi test server</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 20px; background: #111; color: #eee; }
+  h1 { font-size: 1.3rem; margin: 0 0 4px; }
+  #status { font-size: .9rem; color: #aaa; margin-bottom: 20px; }
+  .ok { color: #6c6 !important; } .bad { color: #e77 !important; }
+  table { border-collapse: collapse; width: 100%; max-width: 420px; font-variant-numeric: tabular-nums; }
+  th, td { padding: 10px 8px; text-align: right; border-bottom: 1px solid #333; font-size: 1.1rem; }
+  th:first-child, td:first-child { text-align: left; color: #aaa; font-weight: normal; }
+</style></head>
+<body>
+<h1>Pi test server</h1>
+<div id="status">connecting...</div>
+<table>
+  <tr><th></th><th>X</th><th>Y</th><th>Z</th></tr>
+  <tr><td>Accel (g)</td><td id="a0">-</td><td id="a1">-</td><td id="a2">-</td></tr>
+  <tr><td>Gyro (°/s)</td><td id="g0">-</td><td id="g1">-</td><td id="g2">-</td></tr>
+</table>
+<div style="display:flex;align-items:center;gap:10px;margin-top:10px;max-width:420px">
+  <button id="cal-btn">Calibrate gyro</button>
+  <span id="cal-msg" style="color:#aaa;font-size:.9rem">Hold the sensor still, then press.</span>
+</div>
+<label style="display:block;margin-top:10px;max-width:420px">Calibration time <b id="cal-s-n">2.0</b> s
+  <input id="cal-s" type="range" min="0.5" max="10" step="0.5" value="2" style="width:100%"></label>
+
+<h1 style="margin-top:32px">Motion audio</h1>
+<div class="seg" role="radiogroup">
+  <button id="mo-mode-volume" data-mode="volume" class="on">Movement &rarr; volume</button>
+  <button id="mo-mode-pitch" data-mode="pitch">Movement &rarr; pitch</button>
+</div>
+<div id="mo-desc" style="color:#aaa;font-size:.9rem;max-width:420px;margin-top:8px"></div>
+<div class="btns"><button id="mo-toggle">Start sound</button></div>
+<div class="meter-row"><span>Gyro speed</span><div class="meter"><div id="mo-rate" style="background:#58a"></div></div><span id="mo-rate-n">0 °/s</span></div>
+<div class="meter-row"><span>Volume</span><div class="meter"><div id="mo-gain"></div></div><span id="mo-gain-n">0%</span></div>
+<div class="meter-row"><span>Pitch now</span><div class="meter"><div id="mo-pitch" style="background:#c8a"></div></div><span id="mo-pitch-n">220 Hz</span></div>
+<label style="display:block;margin-top:14px;max-width:420px"><span id="mo-full-label">Full volume</span> at <b id="mo-full-n">150</b> °/s
+  <input id="mo-full" type="range" min="20" max="500" step="10" value="150" style="width:100%"></label>
+<label style="display:block;margin-top:14px;max-width:420px"><span id="mo-hz-label">Pitch</span> <b id="mo-hz-n">220 Hz (A3)</b>
+  <input id="mo-hz" type="range" min="0" max="1000" value="500" style="width:100%"></label>
+<div id="mo-msg" class="bad" style="font-size:.9rem;margin-top:6px"></div>
+<style>
+  .meter-row { display: flex; align-items: center; gap: 10px; max-width: 420px; margin-top: 12px; }
+  .meter-row span:first-child { width: 90px; color: #aaa; }
+  .meter-row span:last-child { width: 70px; text-align: right; font-variant-numeric: tabular-nums; }
+  .meter { flex: 1; height: 14px; background: #222; border-radius: 7px; overflow: hidden; }
+  .meter div { height: 100%; width: 0; background: #6c6; transition: width .05s linear; }
+  .seg { display: flex; max-width: 420px; margin-top: 10px; }
+  .seg button { flex: 1; border-radius: 0; }
+  .seg button:first-child { border-radius: 8px 0 0 8px; }
+  .seg button:last-child { border-radius: 0 8px 8px 0; border-left: none; }
+  .seg button.on { background: #2d4a2d; border-color: #6c6; color: #fff; }
+</style>
+
+<h1 style="margin-top:32px">Bluetooth speaker</h1>
+<div id="spk-status" style="margin-bottom:12px;color:#aaa">checking...</div>
+<select id="spk-select"></select>
+<div class="btns">
+  <button id="spk-use">Use this speaker</button>
+  <button id="spk-connect">Connect</button>
+  <button id="spk-disconnect">Disconnect</button>
+  <button id="spk-tone">Say "bruh"</button>
+  <button id="spk-pair">Pair new speaker</button>
+</div>
+<p style="font-size:.8rem;color:#888;max-width:420px">Only devices already paired with the Pi are listed.
+Pair a new speaker once on the Pi: <code>bluetoothctl</code> &rarr; <code>scan on</code> &rarr;
+<code>pair MAC</code> &rarr; <code>trust MAC</code>.</p>
+<div id="pair-modal" class="modal" hidden>
+  <div class="modal-box">
+    <div class="modal-head"><h2>Pair a new speaker</h2><button id="pair-close" aria-label="Close">&times;</button></div>
+    <div id="pair-status" style="color:#aaa;font-size:.9rem">Put the speaker in pairing mode.</div>
+    <ul id="pair-list"></ul>
+    <div style="display:flex;gap:8px"><button id="pair-rescan">Scan again</button></div>
+  </div>
+</div>
+<style>
+  select, button { font-size: 1rem; padding: 10px 12px; border-radius: 8px; border: 1px solid #444;
+                   background: #222; color: #eee; }
+  select { width: 100%; max-width: 420px; }
+  .btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  button:disabled { opacity: .5; }
+  .modal { position: fixed; inset: 0; background: rgba(0,0,0,.7); display: flex;
+           align-items: center; justify-content: center; padding: 16px; z-index: 10; }
+  .modal[hidden] { display: none; }
+  .modal-box { background: #1a1a1a; border: 1px solid #444; border-radius: 12px; padding: 16px;
+               width: 100%; max-width: 420px; max-height: 80vh; display: flex; flex-direction: column; gap: 12px; }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; }
+  .modal-head h2 { font-size: 1.1rem; margin: 0; }
+  .modal-head button { padding: 4px 12px; font-size: 1.3rem; }
+  #pair-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; }
+  #pair-list li { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid #333; }
+  #pair-list li div { flex: 1; min-width: 0; }
+  #pair-list li small { display: block; color: #888; }
+  #pair-list .empty { color: #888; justify-content: center; }
+</style>
+<script>
+const calBtn = document.getElementById("cal-btn"), calMsg = document.getElementById("cal-msg");
+const calS = document.getElementById("cal-s");
+calS.oninput = () => document.getElementById("cal-s-n").textContent = Number(calS.value).toFixed(1);
+calBtn.onclick = async () => {
+  const seconds = Number(calS.value);
+  calBtn.disabled = calS.disabled = true;
+  calMsg.textContent = `Calibrating... keep still (${seconds} s)`; calMsg.className = "";
+  try {
+    const r = await fetch("/api/imu/calibrate", {method: "POST", headers: {"Content-Type": "application/json"},
+                                                 body: JSON.stringify({seconds})});
+    const j = await r.json();
+    calMsg.textContent = r.ok ? j.message : "Error: " + j.detail;
+    calMsg.className = r.ok ? "ok" : "bad";
+  } catch (e) { calMsg.textContent = "Error: " + e.message; calMsg.className = "bad"; }
+  calBtn.disabled = calS.disabled = false;
+};
+
+let moEnabled = false, fullDps = 150;
+const moToggle = document.getElementById("mo-toggle"), moMsg = document.getElementById("mo-msg");
+const moFull = document.getElementById("mo-full");
+
+async function setMotion(body) {
+  moMsg.textContent = "";
+  const r = await fetch("/api/motion", {method: "POST", headers: {"Content-Type": "application/json"},
+                                        body: JSON.stringify(body)});
+  const j = await r.json();
+  if (!r.ok) { moMsg.textContent = j.detail; return; }
+  renderMotion(j);
+}
+moToggle.onclick = () => setMotion({enabled: !moEnabled});
+document.querySelectorAll(".seg button").forEach(b => b.onclick = () => setMotion({mode: b.dataset.mode}));
+moFull.oninput = () => document.getElementById("mo-full-n").textContent = moFull.value;
+moFull.onchange = () => setMotion({full_dps: Number(moFull.value)});
+
+// Pitch slider is logarithmic (each step is the same musical interval), 55-880 Hz = A1..A5.
+const moHz = document.getElementById("mo-hz"), HZ_LO = 55, HZ_HI = 880;
+const sliderToHz = v => HZ_LO * Math.pow(HZ_HI / HZ_LO, v / 1000);
+const hzToSlider = hz => 1000 * Math.log(hz / HZ_LO) / Math.log(HZ_HI / HZ_LO);
+const NOTES = ["A", "A#", "B", "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#"];
+function hzLabel(hz) {
+  const semis = Math.round(12 * Math.log2(hz / 440));            // from A4
+  const name = NOTES[((semis % 12) + 12) % 12];
+  const octave = 4 + Math.floor((semis + 9) / 12);              // octaves start at C
+  return `${Math.round(hz)} Hz (≈${name}${octave})`;
+}
+let rootHz = 220, hzTimer = null;
+moHz.oninput = () => {
+  const hz = sliderToHz(Number(moHz.value));
+  document.getElementById("mo-hz-n").textContent = hzLabel(hz);
+  clearTimeout(hzTimer);  // send while dragging (throttled), so you hear it slide
+  hzTimer = setTimeout(() => setMotion({root_hz: hz}), 60);
+};
+
+function renderMotion(m) {
+  moEnabled = m.enabled;
+  moToggle.textContent = m.enabled ? "Stop sound" : "Start sound";
+  const pitchMode = m.mode === "pitch";
+  document.querySelectorAll(".seg button").forEach(b => b.classList.toggle("on", b.dataset.mode === m.mode));
+  document.getElementById("mo-desc").textContent = pitchMode
+    ? `Always at full volume. Pitch rises from ${Math.round(m.root_hz)} Hz at rest to ${Math.round(m.top_hz)} Hz (two octaves up) at full speed.`
+    : "Pitch stays put. The faster the sensor turns, the louder it gets; silent at rest.";
+  document.getElementById("mo-full-label").textContent = pitchMode ? "Highest pitch" : "Full volume";
+  document.getElementById("mo-hz-label").textContent = pitchMode ? "Resting pitch" : "Pitch";
+  document.getElementById("mo-gain").style.width = (m.gain * 100) + "%";
+  document.getElementById("mo-gain-n").textContent = Math.round(m.gain * 100) + "%";
+  const pitchFrac = Math.log(m.playing_hz / m.root_hz) / Math.log(m.top_hz / m.root_hz);
+  document.getElementById("mo-pitch").style.width = Math.max(0, Math.min(1, pitchFrac)) * 100 + "%";
+  document.getElementById("mo-pitch-n").textContent = Math.round(m.playing_hz) + " Hz";
+  document.getElementById("mo-rate").style.width = Math.min(100, m.rate_dps / m.full_dps * 100) + "%";
+  document.getElementById("mo-rate-n").textContent = Math.round(m.rate_dps) + " °/s";
+  if (document.activeElement !== moFull && m.full_dps !== fullDps) {
+    fullDps = m.full_dps; moFull.value = fullDps;
+    document.getElementById("mo-full-n").textContent = Math.round(fullDps);
+  }
+  if (document.activeElement !== moHz && m.root_hz !== rootHz) {
+    rootHz = m.root_hz; moHz.value = hzToSlider(rootHz);
+    document.getElementById("mo-hz-n").textContent = hzLabel(rootHz);
+  }
+}
+
+const spkStatus = document.getElementById("spk-status");
+const spkSelect = document.getElementById("spk-select");
+let busy = false;
+
+function renderSpeaker(s) {
+  spkStatus.textContent = s.message;
+  spkStatus.className = s.connected ? "ok" : (s.mac ? "bad" : "");
+  const current = [...spkSelect.options].map(o => o.value).join();
+  const wanted = s.paired.map(d => d.mac).join();
+  if (current !== wanted) {
+    spkSelect.innerHTML = s.paired.length ? "" : "<option value=''>no paired devices</option>";
+    s.paired.forEach(d => spkSelect.add(new Option(`${d.name} (${d.mac})`, d.mac)));
+  }
+  if (s.mac && document.activeElement !== spkSelect) spkSelect.value = s.mac;
+}
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} :
+    {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.detail || r.statusText);
+  return j;
+}
+
+async function action(path, body, holdMs = 0) {
+  if (busy) return;
+  busy = true;
+  document.querySelectorAll(".btns button").forEach(b => b.disabled = true);
+  spkStatus.textContent = "working... (can take up to 15 s)"; spkStatus.className = "";
+  try { renderSpeaker(await api(path, body)); }
+  catch (e) { spkStatus.textContent = "Error: " + e.message; spkStatus.className = "bad"; }
+  // keep a result message on screen briefly before polling overwrites it
+  if (holdMs) await new Promise(r => setTimeout(r, holdMs));
+  busy = false;
+  document.querySelectorAll(".btns button").forEach(b => b.disabled = false);
+}
+
+document.getElementById("spk-use").onclick = () => action("/api/speaker", {mac: spkSelect.value || null});
+document.getElementById("spk-connect").onclick = () => action("/api/speaker/connect", {});
+document.getElementById("spk-disconnect").onclick = () => action("/api/speaker/disconnect", {});
+document.getElementById("spk-tone").onclick = () => action("/api/speaker/test-tone", {}, 4000);
+
+async function poll() {
+  if (!busy) { try { renderSpeaker(await api("/api/speaker")); } catch (e) {} }
+  setTimeout(poll, 2000);
+}
+poll();
+
+// Pairing menu. Expects these endpoints on the Pi:
+//   POST /api/speaker/scan  (empty body)  start (or restart) a scan
+//   GET  /api/speaker/scan  -> {scanning: bool,
+//                               devices: [{mac, name, paired?: bool, rssi?: number}]}
+//   POST /api/speaker/pair  {mac}  pair + trust + connect; returns the same
+//                                  JSON as GET /api/speaker (renderSpeaker)
+// Errors use FastAPI's {detail: "..."} like the other endpoints.
+const pairModal = document.getElementById("pair-modal"), pairList = document.getElementById("pair-list");
+const pairStatus = document.getElementById("pair-status"), pairRescan = document.getElementById("pair-rescan");
+let pairTimer = null, pairing = false;
+
+function setPairStatus(text, cls = "") { pairStatus.textContent = text; pairStatus.className = cls; }
+
+function renderDevices(devices) {
+  pairList.innerHTML = "";
+  if (!devices.length) {
+    pairList.innerHTML = "<li class='empty'>No devices found yet</li>";
+    return;
+  }
+  devices.forEach(d => {
+    const li = document.createElement("li");
+    const info = document.createElement("div");
+    info.textContent = d.name || d.mac;
+    const sub = document.createElement("small");
+    sub.textContent = d.mac + (d.rssi != null ? ` · ${d.rssi} dBm` : "");
+    info.appendChild(sub);
+    const btn = document.createElement("button");
+    btn.textContent = d.paired ? "Paired" : "Pair";
+    btn.disabled = d.paired || pairing;
+    btn.onclick = () => pairDevice(d);
+    li.append(info, btn);
+    pairList.appendChild(li);
+  });
+}
+
+async function refreshScan() {
+  try {
+    const s = await api("/api/speaker/scan");
+    if (!pairing) {
+      renderDevices(s.devices || []);
+      setPairStatus(s.scanning ? "Scanning..." : "Scan finished.");
+    }
+    if (s.scanning) pairTimer = setTimeout(refreshScan, 1500);
+  } catch (e) { if (!pairing) setPairStatus("Error: " + e.message, "bad"); }
+}
+
+async function startScan() {
+  clearTimeout(pairTimer);
+  pairRescan.disabled = true;
+  setPairStatus("Starting scan...");
+  try { await api("/api/speaker/scan", {}); await refreshScan(); }
+  catch (e) { setPairStatus("Error: " + e.message, "bad"); }
+  pairRescan.disabled = false;
+}
+
+async function pairDevice(d) {
+  pairing = true;
+  pairList.querySelectorAll("button").forEach(b => b.disabled = true);
+  pairRescan.disabled = true;
+  setPairStatus(`Pairing with ${d.name || d.mac}... (can take up to 30 s)`);
+  try {
+    renderSpeaker(await api("/api/speaker/pair", {mac: d.mac}));
+    setPairStatus(`Paired with ${d.name || d.mac}.`, "ok");
+    d.paired = true;
+  } catch (e) { setPairStatus("Pairing failed: " + e.message, "bad"); }
+  pairing = false;
+  pairRescan.disabled = false;
+  refreshScan();
+}
+
+function closePairMenu() { pairModal.hidden = true; clearTimeout(pairTimer); }
+document.getElementById("spk-pair").onclick = () => {
+  pairModal.hidden = false;
+  renderDevices([]);
+  startScan();
+};
+document.getElementById("pair-close").onclick = closePairMenu;
+pairRescan.onclick = startScan;
+pairModal.onclick = e => { if (e.target === pairModal && !pairing) closePairMenu(); };
+
+const st = document.getElementById("status");
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.motion) renderMotion(m.motion);
+    if (m.data) {
+      st.textContent = "connected - live"; st.className = "ok";
+      m.data.accel.forEach((v, i) => document.getElementById("a" + i).textContent = v.toFixed(3));
+      m.data.gyro.forEach((v, i) => document.getElementById("g" + i).textContent = v.toFixed(2));
+    } else {
+      st.textContent = "connected - " + m.status; st.className = "bad";
+    }
+  };
+  ws.onclose = () => { st.textContent = "disconnected, retrying..."; st.className = "bad"; setTimeout(connect, 1000); };
+}
+connect();
+</script>
+</body></html>

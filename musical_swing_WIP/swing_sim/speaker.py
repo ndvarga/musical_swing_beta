@@ -154,6 +154,52 @@ class SpeakerManager:
         self._refresh(mac, note=None if ok else f"Disconnect failed: {self._last_line(out)}")
         return ok
 
+    def scan(self, timeout:float = 30) -> str:
+        """
+        Scan for Bluetooth devices, with a user set timeout
+        """
+        if not self._check_available():
+            return False
+        # scan for bluetooth devices
+
+        p = subprocess.run([self._bluetoothctl, "--timeout", str(timeout), "scan", "on"],
+                       capture_output=True,
+                       text=True,
+                       timeout=timeout + 5,
+                       )
+        scan_out = p.stdout
+        print(scan_out)
+        scan_ok = p.returncode == 0
+        if not scan_ok:
+            raise(RuntimeError(f"Bluetooth scan failed: {self._last_line((p.stdout + p.stderr).strip())}"))
+
+        discovered_devices = self._discovered_devices(named_only=False)
+        for n, device in enumerate(discovered_devices):
+            print(f"device {n}: {device}\n")
+
+        return discovered_devices
+
+    def pair(self, mac:str) -> dict:
+        """
+        Runs pair and trust subprocess to pair Pi to ```mac``` and trust it
+        """
+        result = {"error":"", "mac":""}
+        
+        for args, t in ((["--agent", "NoInputNoOutput", "pair", mac], 30),
+                            (["trust", mac], 10)):
+                p = subprocess.run([self._bluetoothctl, *args], 
+                                   capture_output=True, 
+                                   text=True, 
+                                   timeout=t)
+                if p.returncode != 0 or "Failed" in p.stdout:
+                    result["error"] = (p.stdout + p.stderr).strip().splitlines()[-1]
+ 
+                result["mac"] = mac
+        return result            
+                
+                
+            
+
     # ---------------------------
     # Internals
     # ---------------------------
@@ -214,6 +260,31 @@ class SpeakerManager:
         # jack/HDMI instead, so stay silent until the speaker is back.
         self._set_audio_mute(not connected)
 
+    def _parse_devices(self, out: str) -> list:
+        """
+        Parses output of bluetoothctl scan on to send to web app API.
+        """
+        devices = []
+        for line in out.splitlines():
+            parts = line.split(" ", 2)
+            if len(parts) >= 2 and parts[0] == "Device":
+                name = parts[2] if len(parts) > 2 else parts[1]
+                devices.append({"mac": parts[1], "name": name})
+        return devices
+
+    def _discovered_devices(self, named_only: bool = True) -> list[str]:
+        """
+        returns discovered devices as a list 
+        """
+        out = subprocess.run([self._bluetoothctl, "devices"], 
+                             capture_output=True, 
+                             text=True, 
+                             timeout=5).stdout
+        devices = self._parse_devices(out)
+        if named_only:  # unnamed devices show their MAC with dashes as the name
+            devices = [d for d in devices if d["name"] != d["mac"].replace(":", "-")]
+        return devices
+
     def _set_audio_mute(self, mute: bool) -> None:
         if self.audio is not None:
             self.audio.set_fault_mute("speaker", mute)
@@ -237,3 +308,4 @@ class SpeakerManager:
                     self._refresh(mac, note=None if ok else f"Reconnect failed: {self._last_line(out)}")
             self._wake.wait(self.poll_interval_s)
             self._wake.clear()
+

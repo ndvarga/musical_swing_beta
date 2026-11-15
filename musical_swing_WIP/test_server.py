@@ -13,23 +13,24 @@ it's reconnected on the next start too.
     python test_server.py --speaker XX:XX:XX:XX:XX:XX
 """
 
+import subprocess
+import shutil
 import argparse
 import asyncio
 import json
 import shutil
 import socket
-import struct
 import subprocess
 import threading
-import time
 from pathlib import Path
 from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from swing_sim.imu_hw import MPU6050Reader
 from swing_sim.speaker import SpeakerManager
 
 try:
@@ -40,73 +41,7 @@ except (ImportError, OSError) as e:  # OSError: PortAudio library missing
     sd = None
     _SD_ERROR = str(e)
 
-try:
-    from smbus2 import SMBus
-except ImportError:
-    SMBus = None
-
-ADDR = 0x68
-PWR_MGMT_1, ACCEL_CONFIG, GYRO_CONFIG, ACCEL_XOUT_H = 0x6B, 0x1C, 0x1B, 0x3B
-ACCEL_LSB_PER_G, GYRO_LSB_PER_DPS = 16384.0, 131.0
-
-
-class IMU:
-    """
-    Reads the sensor on a background thread at ~100 Hz and keeps the
-    latest sample, so the motion audio and every open page share one
-    reader. Opens the sensor lazily and reconnects after errors.
-    """
-
-    def __init__(self, bus_num: int = 1, hz: float = 100.0):
-        self.bus_num = bus_num
-        self.bus = None
-        self.period = 1.0 / hz
-        self._lock = threading.Lock()
-        self._latest = None
-        self._latest_at = 0.0
-        self._status = "starting"
-        self._thread = None
-
-    def start(self) -> None:
-        if self._thread is None:
-            self._thread = threading.Thread(target=self._run, name="imu", daemon=True)
-            self._thread.start()
-
-    def _run(self) -> None:
-        while True:
-            data, status = self.read()
-            with self._lock:
-                self._status = status
-                if data is not None:
-                    self._latest, self._latest_at = data, time.monotonic()
-            time.sleep(self.period if data is not None else 1.0)  # back off while missing
-
-    def get(self, max_age_s: float = 0.5):
-        """(data, status); data is None if the last good sample is stale."""
-        with self._lock:
-            fresh = time.monotonic() - self._latest_at <= max_age_s
-            return (self._latest if fresh else None), self._status
-
-    def read(self):
-        try:
-            if self.bus is None:
-                if SMBus is None:
-                    return None, "smbus2 not installed"
-                self.bus = SMBus(self.bus_num)
-                self.bus.write_byte_data(ADDR, PWR_MGMT_1, 0x00)
-                self.bus.write_byte_data(ADDR, ACCEL_CONFIG, 0x00)
-                self.bus.write_byte_data(ADDR, GYRO_CONFIG, 0x00)
-            raw = bytes(self.bus.read_i2c_block_data(ADDR, ACCEL_XOUT_H, 14))
-        except OSError as e:
-            if self.bus is not None:
-                self.bus.close()
-            self.bus = None
-            return None, f"sensor not available ({e.strerror or e})"
-        ax, ay, az, _temp, gx, gy, gz = struct.unpack(">7h", raw)
-        return {
-            "accel": [round(v / ACCEL_LSB_PER_G, 3) for v in (ax, ay, az)],
-            "gyro": [round(v / GYRO_LSB_PER_DPS, 2) for v in (gx, gy, gz)],
-        }, "ok"
+STALE_S = 0.5  # a sample older than this counts as "sensor lost"
 
 
 SPEAKER_FILE = Path(__file__).with_name("test_server_speaker.json")
@@ -233,7 +168,7 @@ class MotionAudio:
     PITCH_RANGE_OCT = 2.0
     MODES = ("volume", "pitch")
 
-    def __init__(self, imu: "IMU"):
+    def __init__(self, imu: MPU6050Reader):
         self.imu = imu
         self.mode = "volume"
         self.dead_dps = 8.0
@@ -257,11 +192,11 @@ class MotionAudio:
         return self.root_hz
 
     def motion_amount(self) -> float:
-        data, _ = self.imu.get()
-        if data is None:
+        sample = self.imu.get_latest()
+        if sample is None or self.imu.seconds_since_last_sample() > STALE_S:
             self.rate_dps = 0.0
             return 0.0
-        self.rate_dps = float(np.linalg.norm(data["gyro"]))
+        self.rate_dps = float(np.degrees(self.imu.raw_feature_from(sample)))
         x = (self.rate_dps - self.dead_dps) / max(1e-6, self.full_dps - self.dead_dps)
         return float(min(1.0, max(0.0, x)))
 
@@ -346,217 +281,16 @@ def play_test_tone() -> str:
 
 
 app = FastAPI()
-imu = IMU()
+imu = MPU6050Reader(sample_hz=100, feature_mode="magnitude")
 motion = MotionAudio(imu)
 speaker = SpeakerManager(speaker_mac=None, auto_start=False)  # started in __main__
 
-PAGE = """<!doctype html>
-<html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pi test server</title>
-<style>
-  body { font-family: system-ui, sans-serif; margin: 0; padding: 20px; background: #111; color: #eee; }
-  h1 { font-size: 1.3rem; margin: 0 0 4px; }
-  #status { font-size: .9rem; color: #aaa; margin-bottom: 20px; }
-  .ok { color: #6c6 !important; } .bad { color: #e77 !important; }
-  table { border-collapse: collapse; width: 100%; max-width: 420px; font-variant-numeric: tabular-nums; }
-  th, td { padding: 10px 8px; text-align: right; border-bottom: 1px solid #333; font-size: 1.1rem; }
-  th:first-child, td:first-child { text-align: left; color: #aaa; font-weight: normal; }
-</style></head>
-<body>
-<h1>Pi test server</h1>
-<div id="status">connecting...</div>
-<table>
-  <tr><th></th><th>X</th><th>Y</th><th>Z</th></tr>
-  <tr><td>Accel (g)</td><td id="a0">-</td><td id="a1">-</td><td id="a2">-</td></tr>
-  <tr><td>Gyro (°/s)</td><td id="g0">-</td><td id="g1">-</td><td id="g2">-</td></tr>
-</table>
-
-<h1 style="margin-top:32px">Motion audio</h1>
-<div class="seg" role="radiogroup">
-  <button id="mo-mode-volume" data-mode="volume" class="on">Movement &rarr; volume</button>
-  <button id="mo-mode-pitch" data-mode="pitch">Movement &rarr; pitch</button>
-</div>
-<div id="mo-desc" style="color:#aaa;font-size:.9rem;max-width:420px;margin-top:8px"></div>
-<div class="btns"><button id="mo-toggle">Start sound</button></div>
-<div class="meter-row"><span>Gyro speed</span><div class="meter"><div id="mo-rate" style="background:#58a"></div></div><span id="mo-rate-n">0 °/s</span></div>
-<div class="meter-row"><span>Volume</span><div class="meter"><div id="mo-gain"></div></div><span id="mo-gain-n">0%</span></div>
-<div class="meter-row"><span>Pitch now</span><div class="meter"><div id="mo-pitch" style="background:#c8a"></div></div><span id="mo-pitch-n">220 Hz</span></div>
-<label style="display:block;margin-top:14px;max-width:420px"><span id="mo-full-label">Full volume</span> at <b id="mo-full-n">150</b> °/s
-  <input id="mo-full" type="range" min="20" max="500" step="10" value="150" style="width:100%"></label>
-<label style="display:block;margin-top:14px;max-width:420px"><span id="mo-hz-label">Pitch</span> <b id="mo-hz-n">220 Hz (A3)</b>
-  <input id="mo-hz" type="range" min="0" max="1000" value="500" style="width:100%"></label>
-<div id="mo-msg" class="bad" style="font-size:.9rem;margin-top:6px"></div>
-<style>
-  .meter-row { display: flex; align-items: center; gap: 10px; max-width: 420px; margin-top: 12px; }
-  .meter-row span:first-child { width: 90px; color: #aaa; }
-  .meter-row span:last-child { width: 70px; text-align: right; font-variant-numeric: tabular-nums; }
-  .meter { flex: 1; height: 14px; background: #222; border-radius: 7px; overflow: hidden; }
-  .meter div { height: 100%; width: 0; background: #6c6; transition: width .05s linear; }
-  .seg { display: flex; max-width: 420px; margin-top: 10px; }
-  .seg button { flex: 1; border-radius: 0; }
-  .seg button:first-child { border-radius: 8px 0 0 8px; }
-  .seg button:last-child { border-radius: 0 8px 8px 0; border-left: none; }
-  .seg button.on { background: #2d4a2d; border-color: #6c6; color: #fff; }
-</style>
-<script>
-let moEnabled = false, fullDps = 150;
-const moToggle = document.getElementById("mo-toggle"), moMsg = document.getElementById("mo-msg");
-const moFull = document.getElementById("mo-full");
-
-async function setMotion(body) {
-  moMsg.textContent = "";
-  const r = await fetch("/api/motion", {method: "POST", headers: {"Content-Type": "application/json"},
-                                        body: JSON.stringify(body)});
-  const j = await r.json();
-  if (!r.ok) { moMsg.textContent = j.detail; return; }
-  renderMotion(j);
-}
-moToggle.onclick = () => setMotion({enabled: !moEnabled});
-document.querySelectorAll(".seg button").forEach(b => b.onclick = () => setMotion({mode: b.dataset.mode}));
-moFull.oninput = () => document.getElementById("mo-full-n").textContent = moFull.value;
-moFull.onchange = () => setMotion({full_dps: Number(moFull.value)});
-
-// Pitch slider is logarithmic (each step is the same musical interval), 55-880 Hz = A1..A5.
-const moHz = document.getElementById("mo-hz"), HZ_LO = 55, HZ_HI = 880;
-const sliderToHz = v => HZ_LO * Math.pow(HZ_HI / HZ_LO, v / 1000);
-const hzToSlider = hz => 1000 * Math.log(hz / HZ_LO) / Math.log(HZ_HI / HZ_LO);
-const NOTES = ["A", "A#", "B", "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#"];
-function hzLabel(hz) {
-  const semis = Math.round(12 * Math.log2(hz / 440));            // from A4
-  const name = NOTES[((semis % 12) + 12) % 12];
-  const octave = 4 + Math.floor((semis + 9) / 12);              // octaves start at C
-  return `${Math.round(hz)} Hz (≈${name}${octave})`;
-}
-let rootHz = 220, hzTimer = null;
-moHz.oninput = () => {
-  const hz = sliderToHz(Number(moHz.value));
-  document.getElementById("mo-hz-n").textContent = hzLabel(hz);
-  clearTimeout(hzTimer);  // send while dragging (throttled), so you hear it slide
-  hzTimer = setTimeout(() => setMotion({root_hz: hz}), 60);
-};
-
-function renderMotion(m) {
-  moEnabled = m.enabled;
-  moToggle.textContent = m.enabled ? "Stop sound" : "Start sound";
-  const pitchMode = m.mode === "pitch";
-  document.querySelectorAll(".seg button").forEach(b => b.classList.toggle("on", b.dataset.mode === m.mode));
-  document.getElementById("mo-desc").textContent = pitchMode
-    ? `Always at full volume. Pitch rises from ${Math.round(m.root_hz)} Hz at rest to ${Math.round(m.top_hz)} Hz (two octaves up) at full speed.`
-    : "Pitch stays put. The faster the sensor turns, the louder it gets; silent at rest.";
-  document.getElementById("mo-full-label").textContent = pitchMode ? "Highest pitch" : "Full volume";
-  document.getElementById("mo-hz-label").textContent = pitchMode ? "Resting pitch" : "Pitch";
-  document.getElementById("mo-gain").style.width = (m.gain * 100) + "%";
-  document.getElementById("mo-gain-n").textContent = Math.round(m.gain * 100) + "%";
-  const pitchFrac = Math.log(m.playing_hz / m.root_hz) / Math.log(m.top_hz / m.root_hz);
-  document.getElementById("mo-pitch").style.width = Math.max(0, Math.min(1, pitchFrac)) * 100 + "%";
-  document.getElementById("mo-pitch-n").textContent = Math.round(m.playing_hz) + " Hz";
-  document.getElementById("mo-rate").style.width = Math.min(100, m.rate_dps / m.full_dps * 100) + "%";
-  document.getElementById("mo-rate-n").textContent = Math.round(m.rate_dps) + " °/s";
-  if (document.activeElement !== moFull && m.full_dps !== fullDps) {
-    fullDps = m.full_dps; moFull.value = fullDps;
-    document.getElementById("mo-full-n").textContent = Math.round(fullDps);
-  }
-  if (document.activeElement !== moHz && m.root_hz !== rootHz) {
-    rootHz = m.root_hz; moHz.value = hzToSlider(rootHz);
-    document.getElementById("mo-hz-n").textContent = hzLabel(rootHz);
-  }
-}
-</script>
-
-<h1 style="margin-top:32px">Bluetooth speaker</h1>
-<div id="spk-status" style="margin-bottom:12px;color:#aaa">checking...</div>
-<select id="spk-select"></select>
-<div class="btns">
-  <button id="spk-use">Use this speaker</button>
-  <button id="spk-connect">Connect</button>
-  <button id="spk-disconnect">Disconnect</button>
-  <button id="spk-tone">Say "bruh"</button>
-</div>
-<p style="font-size:.8rem;color:#888;max-width:420px">Only devices already paired with the Pi are listed.
-Pair a new speaker once on the Pi: <code>bluetoothctl</code> &rarr; <code>scan on</code> &rarr;
-<code>pair MAC</code> &rarr; <code>trust MAC</code>.</p>
-<style>
-  select, button { font-size: 1rem; padding: 10px 12px; border-radius: 8px; border: 1px solid #444;
-                   background: #222; color: #eee; }
-  select { width: 100%; max-width: 420px; }
-  .btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-  button:disabled { opacity: .5; }
-</style>
-<script>
-const spkStatus = document.getElementById("spk-status");
-const spkSelect = document.getElementById("spk-select");
-let busy = false;
-
-function renderSpeaker(s) {
-  spkStatus.textContent = s.message;
-  spkStatus.className = s.connected ? "ok" : (s.mac ? "bad" : "");
-  const current = [...spkSelect.options].map(o => o.value).join();
-  const wanted = s.paired.map(d => d.mac).join();
-  if (current !== wanted) {
-    spkSelect.innerHTML = s.paired.length ? "" : "<option value=''>no paired devices</option>";
-    s.paired.forEach(d => spkSelect.add(new Option(`${d.name} (${d.mac})`, d.mac)));
-  }
-  if (s.mac && document.activeElement !== spkSelect) spkSelect.value = s.mac;
-}
-
-async function api(path, body) {
-  const r = await fetch(path, body === undefined ? {} :
-    {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
-  const j = await r.json();
-  if (!r.ok) throw new Error(j.detail || r.statusText);
-  return j;
-}
-
-async function action(path, body, holdMs = 0) {
-  if (busy) return;
-  busy = true;
-  document.querySelectorAll(".btns button").forEach(b => b.disabled = true);
-  spkStatus.textContent = "working... (can take up to 15 s)"; spkStatus.className = "";
-  try { renderSpeaker(await api(path, body)); }
-  catch (e) { spkStatus.textContent = "Error: " + e.message; spkStatus.className = "bad"; }
-  // keep a result message on screen briefly before polling overwrites it
-  if (holdMs) await new Promise(r => setTimeout(r, holdMs));
-  busy = false;
-  document.querySelectorAll(".btns button").forEach(b => b.disabled = false);
-}
-
-document.getElementById("spk-use").onclick = () => action("/api/speaker", {mac: spkSelect.value || null});
-document.getElementById("spk-connect").onclick = () => action("/api/speaker/connect", {});
-document.getElementById("spk-disconnect").onclick = () => action("/api/speaker/disconnect", {});
-document.getElementById("spk-tone").onclick = () => action("/api/speaker/test-tone", {}, 4000);
-
-async function poll() {
-  if (!busy) { try { renderSpeaker(await api("/api/speaker")); } catch (e) {} }
-  setTimeout(poll, 2000);
-}
-poll();
-</script>
-<script>
-const st = document.getElementById("status");
-function connect() {
-  const ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.onmessage = (ev) => {
-    const m = JSON.parse(ev.data);
-    if (m.motion) renderMotion(m.motion);
-    if (m.data) {
-      st.textContent = "connected - live"; st.className = "ok";
-      m.data.accel.forEach((v, i) => document.getElementById("a" + i).textContent = v.toFixed(3));
-      m.data.gyro.forEach((v, i) => document.getElementById("g" + i).textContent = v.toFixed(2));
-    } else {
-      st.textContent = "connected - " + m.status; st.className = "bad";
-    }
-  };
-  ws.onclose = () => { st.textContent = "disconnected, retrying..."; st.className = "bad"; setTimeout(connect, 1000); };
-}
-connect();
-</script>
-</body></html>"""
+INDEX_HTML = Path(__file__).with_name("static") / "index.html"
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 def index():
-    return PAGE
+    return FileResponse(INDEX_HTML)  # read from disk each time: edit, then just reload
 
 
 class SpeakerChoice(BaseModel):
@@ -604,6 +338,57 @@ def disconnect_speaker():
     return speaker_state()
 
 
+"""
+Scanning related
+"""
+_scan = {"scanning": False, "error": None}
+_scan_lock = threading.Lock()
+
+def _scan_worker(seconds: float) -> None:
+    """
+    Runs blocking bluetoothctl scan off request thread
+    """
+    error = None
+    try:
+        speaker.scan(seconds)
+    except RuntimeError as e:
+        error = str(e)
+    except Exception as e:
+        error = f"Bluetooth scan failed: {e}"
+    with _scan_lock:
+        _scan.update(scanning=False, error=error)        
+
+@app.post("/api/speaker/scan")
+def start_scan():
+
+    with _scan_lock:
+        if not _scan["scanning"]:
+            _scan.update(scanning=True, error=None)
+            threading.Thread(target=_scan_worker, args=(15,), name="bt-scan", daemon=True).start()
+    return get_scan()
+
+@app.get("/api/speaker/scan")
+def get_scan():
+    """{scanning, devices}; devices fill in while the scan runs."""
+    with _scan_lock:
+        scanning, error = _scan["scanning"], _scan["error"]
+    if error:
+        raise HTTPException(500, error)
+    paired = {d["mac"] for d in paired_devices()}
+    devices = [dict(d, paired=d["mac"] in paired) for d in speaker._discovered_devices()]
+    return {"scanning": scanning, "devices": devices}
+
+@app.post("/api/speaker/pair")
+def pair_speaker(choice: SpeakerChoice):
+    pair_result = speaker.pair(choice.mac)
+    if pair_result["error"] != "":
+        raise HTTPException(500, pair_result["error"])
+
+    speaker.set_speaker_mac(pair_result["mac"]); save_mac(pair_result["mac"]); speaker.connect()
+    return speaker_state()   # page passes this to renderSpeaker()
+
+
+
 @app.post("/api/speaker/test-tone")
 def test_tone():
     try:
@@ -619,6 +404,22 @@ def test_tone():
     else:
         state["message"] = f"Played on {device} -> {state['mac']}. Did you hear 'bruh'?"
     return state
+
+
+class CalibrateSettings(BaseModel):
+    seconds: float = 2.0
+
+# button to calibrate the IMU
+@app.post("/api/imu/calibrate")
+def calibrate_imu(s: Optional[CalibrateSettings] = None):
+    """
+    Averages the gyro for `seconds` (sensor still) as the new zero offset.
+    The body is optional: an empty POST calibrates for 2 s.
+    """
+    seconds = min(10.0, max(0.5, (s or CalibrateSettings()).seconds))
+    if not imu.calibrate_bias(seconds):
+        raise HTTPException(503, imu.message)
+    return {"message": imu.message}
 
 
 class MotionSettings(BaseModel):
@@ -653,7 +454,12 @@ async def ws(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
-            data, status = imu.get()
+            sample = imu.get_latest()
+            data, status = None, imu.message
+            if sample is not None and imu.seconds_since_last_sample() <= STALE_S:
+                accel = sample.accel_xyz if sample.accel_xyz is not None else np.zeros(3)
+                data = {"accel": [round(float(v), 3) for v in accel],
+                        "gyro": [round(float(v), 2) for v in np.degrees(sample.gyro_xyz)]}
             if not motion.running:
                 motion.motion_amount()  # keep the speed readout live while the sound is off
             await websocket.send_json({"data": data, "status": status, "motion": motion.state()})
@@ -683,6 +489,8 @@ if __name__ == "__main__":
         save_mac(speaker.status().mac)
     speaker.start()
     imu.start()
+    print("  Calibrating gyro bias -- keep the sensor still for 2 s...")
+    print("  " + ("done" if imu.calibrate_bias(2.0) else "skipped (no sensor samples)"))
     print(f"\n  Speaker: {speaker.status().mac or 'none chosen yet (pick one on the page)'}")
     print(f"  Open on your phone (same Wi-Fi): http://{lan_ip()}:{args.port}\n")
     try:
@@ -690,3 +498,4 @@ if __name__ == "__main__":
     finally:
         motion.stop()
         speaker.stop()
+        imu.stop()
