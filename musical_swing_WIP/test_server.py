@@ -380,11 +380,8 @@ def get_scan():
 
 @app.post("/api/speaker/pair")
 def pair_speaker(choice: SpeakerChoice):
-    pair_result = speaker.pair(choice.mac)
-    if pair_result["error"] != "":
-        raise HTTPException(500, pair_result["error"])
-
-    speaker.set_speaker_mac(pair_result["mac"]); save_mac(pair_result["mac"]); speaker.connect()
+    ok = speaker.pair(choice.mac)
+    speaker.set_speaker_mac(mac); save_mac(mac); speaker.connect()
     return speaker_state()   # page passes this to renderSpeaker()
 
 
@@ -488,9 +485,7 @@ if __name__ == "__main__":
     if args.speaker:
         save_mac(speaker.status().mac)
     speaker.start()
-    imu.start()
-    print("  Calibrating gyro bias -- keep the sensor still for 2 s...")
-    print("  " + ("done" if imu.calibrate_bias(2.0) else "skipped (no sensor samples)"))
+    imu.start()  # gyro bias starts at zero; calibrate from the page's button
     print(f"\n  Speaker: {speaker.status().mac or 'none chosen yet (pick one on the page)'}")
     print(f"  Open on your phone (same Wi-Fi): http://{lan_ip()}:{args.port}\n")
     try:

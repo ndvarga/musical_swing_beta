@@ -13,6 +13,7 @@ if TYPE_CHECKING:  # type-only, so speaker.py and audio.py never import each oth
 
 _MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
 _PLACEHOLDER_MAC = "AA:BB:CC:DD:EE:FF"
+_AUDIO_SINK_UUID = "0000110b-0000-1000-8000-00805f9b34fb"
 
 
 @dataclass
@@ -133,10 +134,15 @@ class SpeakerManager:
         Connects now. Blocks for up to command_timeout_s. Returns success.
         Re-enables auto_reconnect, undoing a previous disconnect().
         """
+        #auto disconnect if currently connected to a speaker
         self.auto_reconnect = True
         mac = self._current_mac()
         if mac is None or not self._check_available():
             return False
+
+        #Disconnect from other speakers
+        # TODO: not useful if we want to connect to multiple speakers
+        self._disconnect_others(keep=mac)
         ok, out = self._bt("connect", mac)
         self._refresh(mac, note=None if ok else f"Connect failed: {self._last_line(out)}")
         return self.status().connected
@@ -179,23 +185,18 @@ class SpeakerManager:
 
         return discovered_devices
 
-    def pair(self, mac:str) -> dict:
+    def pair(self, mac:str) -> bool:
         """
-        Runs pair and trust subprocess to pair Pi to ```mac``` and trust it
+        Runs Bluetooth pair and trust subprocess to pair Pi to ```mac``` and trust it
+        Returns False if error
         """
-        result = {"error":"", "mac":""}
-        
         for args, t in ((["--agent", "NoInputNoOutput", "pair", mac], 30),
                             (["trust", mac], 10)):
-                p = subprocess.run([self._bluetoothctl, *args], 
-                                   capture_output=True, 
-                                   text=True, 
-                                   timeout=t)
-                if p.returncode != 0 or "Failed" in p.stdout:
-                    result["error"] = (p.stdout + p.stderr).strip().splitlines()[-1]
- 
-                result["mac"] = mac
-        return result            
+                ok, out = self._bt(*args, timeout=t)
+                if not ok or "Failed" in out:
+                    raise RuntimeError(f"{args[-2].capitalize()} failed: {self._last_line(out)}")
+     
+        return ok            
                 
                 
             
@@ -220,7 +221,7 @@ class SpeakerManager:
             return False
         return True
 
-    def _bt(self, *args: str) -> Tuple[bool, str]:
+    def _bt(self, *args: str, timeout: Optional[float]) -> Tuple[bool, str]:
         """Runs one bluetoothctl command. Returns (ok, full combined output)."""
         with self._bt_lock:
             try:
@@ -228,7 +229,7 @@ class SpeakerManager:
                     [self._bluetoothctl, *args],
                     capture_output=True,
                     text=True,
-                    timeout=self.command_timeout_s,
+                    timeout=timeout or self.command_timeout_s,
                 )
             except subprocess.TimeoutExpired:
                 return False, f"bluetoothctl {args[0]} timed out"
@@ -260,9 +261,19 @@ class SpeakerManager:
         # jack/HDMI instead, so stay silent until the speaker is back.
         self._set_audio_mute(not connected)
 
+    def _connected_audio_devices(self) -> list:
+        ok, out = self._bt("devices", "Connected")
+        macs = [d["mac"] for d in self._parse_devices(out)] if ok else []
+        return [m for m in macs if _AUDIO_SINK_UUID in self._bt("info", m)[1].lower()]
+
+    def _disconnect_others(self, keep:str):
+        for other in self._connected_audio_devices():
+            if other != keep:
+                self._bt("disconnect", other)        
+
     def _parse_devices(self, out: str) -> list:
         """
-        Parses output of bluetoothctl scan on to send to web app API.
+        Parses output of ```bluetoothctl scan on``` to send to web app API "Pair new speaker" menu.
         """
         devices = []
         for line in out.splitlines():
