@@ -22,6 +22,7 @@ import shutil
 import socket
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -33,6 +34,9 @@ from pydantic import BaseModel
 from swing_sim.imu_hw import MPU6050Reader
 from swing_sim.speaker import SpeakerManager
 from swing_sim.audio import AudioEngine, AudioConfig, AudioStatus
+from swing_sim.control import IntensityEstimator, Controller, EnvelopeConfig, ControlConfig
+# TODO: implement the API calls for these
+from swing_sim.calibration import CalibrationManager, CalibrationResult
 
 try:
     import numpy as np
@@ -146,6 +150,10 @@ def pick_output_device() -> str:
 
 class MotionAudio:
     """
+    DEBUG ONLY: a test tone for checking the sensor -> sound path, not the
+    real audio pipeline (that's the layer engine: AudioEngine + Controller).
+    Driven from the page's "Debug: test tone" section via /api/debug/tone.
+
     Plays a continuous chord driven by how fast the gyro is turning. The
     turning speed becomes a motion amount from 0 (below dead_dps: sensor
     noise/offset at rest) to 1 (full_dps and above), smoothed with a quick
@@ -160,11 +168,9 @@ class MotionAudio:
     CHORD_RATIOS = np.array([1.0, 2 ** (4 / 12), 2 ** (7 / 12), 2.0])  # major triad + octave
     ROOT_HZ = 220.0  # chord root (A3)
     ATTACK_S, RELEASE_S = 0.08, 0.6
-    MODES = ("volume",)
 
     def __init__(self, imu: MPU6050Reader):
         self.imu = imu
-        self.mode = "volume"
         self.dead_dps = 8.0
         self.full_dps = 150.0
         self.stream = None
@@ -226,7 +232,7 @@ class MotionAudio:
         self.gain = self.level = 0.0  # next start fades in from silence
 
     def state(self) -> dict:
-        return {"enabled": self.running, "mode": self.mode,
+        return {"enabled": self.running,
                 "gain": round(self.gain, 3), "level": round(self.level, 3),
                 "rate_dps": round(self.rate_dps, 1), "full_dps": self.full_dps,
                 "device": self.device}
@@ -258,12 +264,17 @@ def play_test_tone() -> str:
         _tone_lock.release()
 
 
+# setting up all the components we need
 app = FastAPI()
 imu = MPU6050Reader(sample_hz=100, feature_mode="magnitude")
 motion = MotionAudio(imu)
 speaker = SpeakerManager(speaker_mac=None, auto_start=False)  # started in __main__
 audio_cfg = AudioConfig()
 audio = AudioEngine(audio_cfg)
+env_cfg = EnvelopeConfig()
+estimator = IntensityEstimator(env_cfg)
+control_cfg = ControlConfig()
+controller = Controller(control_cfg)
 
 INDEX_HTML = Path(__file__).with_name("static") / "index.html"
 
@@ -319,7 +330,7 @@ def disconnect_speaker():
 
 
 """
-Scanning related
+Methods related to scanning for Bluetooth devices from the web app
 """
 _scan = {"scanning": False, "error": None}
 _scan_lock = threading.Lock()
@@ -358,6 +369,9 @@ def get_scan():
     devices = [dict(d, paired=d["mac"] in paired) for d in speaker._discovered_devices()]
     return {"scanning": scanning, "devices": devices}
 
+"""
+Method to pair speaker in "Pair new speaker" menu
+"""
 @app.post("/api/speaker/pair")
 def pair_speaker(choice: SpeakerChoice):
     ok = speaker.pair(choice.mac)
@@ -399,13 +413,129 @@ def calibrate_imu(s: Optional[CalibrateSettings] = None):
     return {"message": imu.message}
 
 
-class MotionSettings(BaseModel):
+# ---- Intensity range calibration (IntensityEstimator floor / max_val) ----
+# Same rule as swing_sim/calibration.py: 95th percentile of the raw feature
+# (gyro magnitude, rad/s), so one bump or gust doesn't set the value. Done
+# directly rather than via CalibrationManager, because that only produces a
+# result once BOTH phases have run, and here each button applies on its own.
+CAL_PERCENTILE = 95
+_range_cal_lock = threading.Lock()
+
+
+def _collect_raw_feature(seconds: float) -> np.ndarray:
+    """Raw intensity feature for every new IMU sample over `seconds` (blocks)."""
+    vals, last_t = [], None
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        sample = imu.get_latest()
+        if sample is not None and sample.t != last_t and imu.seconds_since_last_sample() <= STALE_S:
+            vals.append(imu.raw_feature_from(sample))
+            last_t = sample.t
+        time.sleep(0.005)
+    return np.array(vals, dtype=float)
+
+
+def range_state() -> dict:
+    f, m = estimator.cfg.floor, estimator.cfg.max_val
+    return {"floor": round(f, 4), "max_val": round(m, 4),
+            "floor_dps": round(float(np.degrees(f)), 1), "max_dps": round(float(np.degrees(m)), 1)}
+
+
+@app.get("/api/imu/range")
+def get_range():
+    """Current IntensityEstimator floor/max_val (rad/s, plus °/s for display)."""
+    return range_state()
+
+
+@app.post("/api/imu/calibrate-rest")
+def calibrate_rest(s: Optional[CalibrateSettings] = None):
+    """
+    Swing hanging still. First half of `seconds`: gyro bias (zero offset);
+    second half: floor = 95th percentile of what's left (noise + wobble).
+    Bias goes first because it changes the resting magnitude.
+    """
+    # TODO: Implement
+    raise HTTPException(500, "calibrate rest not implemented")
+
+
+@app.post("/api/imu/calibrate-swing")
+def calibrate_swing(s: Optional[CalibrateSettings] = None):
+    """Someone swinging hard: max_val = 95th percentile of the raw feature over `seconds`."""
+    # TODO: implement from CalibrationManager
+    raise HTTPException(500, "calibrate swing not implemented")
+
+class ToneSettings(BaseModel):
     enabled: Optional[bool] = None
     full_dps: Optional[float] = None
-    mode: Optional[str] = None
+
+"""
+Layer mode related classes and API defs
+"""
+
+class LayerRunner:
+    """
+    runs step loop for IMU -> IntensityEstimator -> Controller -> AudioEngine gains
+    on background thread while layer mode is enabled
+    """
+    def __init__(self, imu:MPU6050Reader, audio:AudioEngine, estimator:IntensityEstimator, controller:Controller, hz: float = 50):
+        self.imu, self.audio = imu, audio
+        self.estimator, self.controller = estimator, controller
+        self.period = 1.0 / hz
+        self.gains = (0.0, 0.0, 0.0)
+        self._stop = threading.Event()
+        self._thread = None
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None
+
+    def start(self) -> None:
+        if self.running:
+            return
+        self.controller.reset()
+        self.estimator.state.envelope = 0.0
+        self.audio.start()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="layer-step", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        self.audio.stop()
+        self.gains = (0.0,0.0,0.0)
+
+    def _run(self) -> None:
+        last = time.monotonic()
+        while not self._stop.wait(self.period):   # sleeps one period; exits as soon as stop() is called
+            now = time.monotonic()
+            dt = min(now - last, 0.1)             # same cap as ui.py, so a stall doesn't jump the envelope
+            last = now
+            self.step(dt)
+
+    def step(self, dt: float):
+        # TODO: calibration manager update
+        sample = self.imu.get_latest()
+        if sample is None or self.imu.seconds_since_last_sample() > STALE_S:
+            self.audio.set_fault_mute("imu", True)
+            return
+        self.audio.set_fault_mute("imu", False)
+        raw_feature = self.imu.raw_feature_from(sample)
+        state = self.estimator.update(raw_feature, dt)
+        ctrl_out = self.controller.update(state.x_norm, dt)
+        #what hsould it do if it chatters
+        if ctrl_out.chatter_flag:
+            self.audio.set_fault_mute("chatter", True)
+            return
+        self.gains = ctrl_out.gains
+        self.audio.set_master_cap(ctrl_out.master_cap)
+        self.audio.set_gains(self.gains)
 
 
-LAYER_MODE = "layers"  # "Movement -> layers": drives swing_sim/audio.py's AudioEngine layers
+class LayerAudioSettings(BaseModel):
+    enabled: bool
 
 
 class LayerChoice(BaseModel):
@@ -415,34 +545,55 @@ class LayerChoice(BaseModel):
 
 @app.get("/api/layers")
 def get_layers():
-    """
-    TODO: return {"files": [...library filenames...],
-                  "layers": [{"file": name_or_None}, x3]}
-    (AudioEngine.library_files() / current_assignments()).
-    """
-    raise HTTPException(501, "Layer mode isn't implemented yet")
+    return {"files": audio.library_files(),
+            "layers": [{"file": f} for f in audio.current_assignments()]}
+
 
 
 @app.post("/api/layers")
 def set_layer(choice: LayerChoice):
-    """
-    TODO: assign choice.file to layer choice.layer (AudioEngine.assign_layer;
-    ValueError/FileNotFoundError -> 400), then return get_layers().
-    """
-    raise HTTPException(501, "Layer mode isn't implemented yet")
+    # TODO: put print in verbose mode
+    print(f"choice idx: {choice.layer}\nchoice file: {choice.file}")
+    try:
+        audio.assign_layer(choice.layer, choice.file)
+    except (ValueError, FileNotFoundError) as e: # wrong index/name 
+        raise HTTPException(400, str(e))
+    except (RuntimeError, OSError) as e:           # file there but unusable
+        raise HTTPException(500, f"Couldn't load {choice.file}: {e}")
+    return get_layers()
 
 
-@app.post("/api/motion")
-def set_motion(s: MotionSettings):
-    if s.mode == LAYER_MODE:
-        # TODO: switch motion audio to the layer engine. While in this mode,
-        # motion.state() should include "mode": "layers" and
-        # "layer_gains": [g0, g1, g2] (0..1) for the page's meters.
-        raise HTTPException(501, "Layer mode isn't implemented yet")
-    if s.mode is not None:
-        if s.mode not in motion.MODES:
-            raise HTTPException(400, f"mode must be one of {motion.MODES}")
-        motion.mode = s.mode
+def layer_audio_state() -> dict:
+    return {"enabled": audio.status.running, "gains": [0.0, 0.0, 0.0]}
+
+layers = LayerRunner(imu, audio, estimator, controller)
+
+@app.post("/api/layers/audio")
+def set_layer_audio(s: LayerAudioSettings):
+    """Starts/stops the layer engine (the real audio). Returns layer_audio_state()."""
+    # TODO: verbose mode
+    motion.stop()  # the debug tone and the layer engine shouldn't play at once
+    if audio.load_issues:
+        for issue in audio.load_issues:
+            print(f"load issues:{issue}")
+    if s.enabled:
+        layers.start()
+        print(f"Layers audio started.\nmessage: {audio.status.message}\nrunning: {audio.status.running}")
+    else:
+        layers.stop()
+        print(f"Layers audio stopped.\nmessage: {audio.status.message}\nrunning: {audio.status.running}")
+
+    return layer_audio_state()
+
+def layer_audio_state() -> dict:
+    return {"enabled": layers.running, "gains": [round(g, 3) for g in layers.gains]}
+
+
+@app.post("/api/debug/tone")
+def set_debug_tone(s: ToneSettings):
+    """DEBUG: the MotionAudio test tone. Not part of the real audio pipeline."""
+    if s.enabled is True and audio.status.running:
+        raise HTTPException(409, "Stop the layer audio first")
     if s.full_dps is not None:
         motion.full_dps = min(1000.0, max(motion.dead_dps + 5, s.full_dps))
     try:
@@ -468,7 +619,8 @@ async def ws(websocket: WebSocket):
                         "gyro": [round(float(v), 2) for v in np.degrees(sample.gyro_xyz)]}
             if not motion.running:
                 motion.motion_amount()  # keep the speed readout live while the sound is off
-            await websocket.send_json({"data": data, "status": status, "motion": motion.state()})
+            await websocket.send_json({"data": data, "status": status,
+                                       "tone": motion.state(), "layers": layer_audio_state()})
             await asyncio.sleep(0.05)  # 20 updates/s
     except WebSocketDisconnect:
         pass
@@ -501,5 +653,6 @@ if __name__ == "__main__":
         uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="info")
     finally:
         motion.stop()
+        layers.stop()
         speaker.stop()
         imu.stop()

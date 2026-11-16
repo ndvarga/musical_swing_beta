@@ -188,11 +188,17 @@ class SpeakerManager:
     def pair(self, mac:str) -> bool:
         """
         Runs Bluetooth pair and trust subprocess to pair Pi to ```mac``` and trust it
-        Returns False if error
+        Returns False if error when running bluetoothctl
         """
+        if not _MAC_RE.match(mac):
+            raise ValueError(f"Not a Bluetooth MAC address: {mac!r}")
+        if not self._check_available():
+            raise RuntimeError("bluetoothctl not found (install bluez)")
         for args, t in ((["--agent", "NoInputNoOutput", "pair", mac], 30),
                             (["trust", mac], 10)):
                 ok, out = self._bt(*args, timeout=t)
+                if "AlreadyExists" in out:
+                    continue
                 if not ok or "Failed" in out:
                     raise RuntimeError(f"{args[-2].capitalize()} failed: {self._last_line(out)}")
      

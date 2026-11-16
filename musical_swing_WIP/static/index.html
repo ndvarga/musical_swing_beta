@@ -19,44 +19,31 @@
   <tr><td>Accel (g)</td><td id="a0">-</td><td id="a1">-</td><td id="a2">-</td></tr>
   <tr><td>Gyro (°/s)</td><td id="g0">-</td><td id="g1">-</td><td id="g2">-</td></tr>
 </table>
-<div style="display:flex;align-items:center;gap:10px;margin-top:10px;max-width:420px">
-  <button id="cal-btn">Calibrate gyro</button>
-  <span id="cal-msg" style="color:#aaa;font-size:.9rem">Hold the sensor still, then press.</span>
+<div class="btns" style="max-width:420px">
+  <button id="cal-btn" class="cal" title="Zero offset only (max 10 s)">Calibrate gyro</button>
+  <button id="cal-rest" class="cal" title="Zero offset + floor: swing hanging still">Calibrate rest</button>
+  <button id="cal-swing" class="cal" title="Max: someone swinging hard">Calibrate swinging</button>
 </div>
+<div id="cal-msg" style="color:#aaa;font-size:.9rem;margin-top:8px;max-width:420px">Rest: swing hanging still. Swinging: someone swinging hard.</div>
+<div id="cal-range" style="color:#888;font-size:.85rem;margin-top:4px;max-width:420px"></div>
 <label style="display:block;margin-top:10px;max-width:420px">Calibration time <b id="cal-s-n">2.0</b> s
-  <input id="cal-s" type="range" min="0.5" max="10" step="0.5" value="2" style="width:100%"></label>
+  <input id="cal-s" type="range" min="0.5" max="30" step="0.5" value="2" style="width:100%"></label>
 
 <h1 style="margin-top:32px">Motion audio</h1>
-<div class="seg" role="radiogroup">
-  <button id="mo-mode-volume" data-mode="volume" class="on">Movement &rarr; volume</button>
-  <button id="mo-mode-layers" data-mode="layers">Movement &rarr; layers</button>
-</div>
-<div id="mo-desc" style="color:#aaa;font-size:.9rem;max-width:420px;margin-top:8px"></div>
-<div class="btns"><button id="mo-toggle">Start sound</button></div>
-<div class="meter-row"><span>Gyro speed</span><div class="meter"><div id="mo-rate" style="background:#58a"></div></div><span id="mo-rate-n">0 °/s</span></div>
-<div class="meter-row"><span>Volume</span><div class="meter"><div id="mo-gain"></div></div><span id="mo-gain-n">0%</span></div>
-<label style="display:block;margin-top:14px;max-width:420px"><span id="mo-full-label">Full volume</span> at <b id="mo-full-n">150</b> °/s
-  <input id="mo-full" type="range" min="20" max="500" step="10" value="150" style="width:100%"></label>
-<div id="layers-panel" hidden>
-  <div id="layers-status" style="color:#aaa;font-size:.9rem;margin-top:14px;max-width:420px"></div>
-  <div id="layers-rows"></div>
-</div>
-<div id="mo-msg" class="bad" style="font-size:.9rem;margin-top:6px"></div>
+<div style="color:#aaa;font-size:.9rem;max-width:420px;margin-top:8px">Plays the three library layers; movement drives each layer's volume.</div>
+<div class="btns"><button id="layers-toggle">Start layers</button></div>
+<div id="layers-status" style="color:#aaa;font-size:.9rem;margin-top:14px;max-width:420px"></div>
+<div id="layers-rows"></div>
 <style>
   .meter-row { display: flex; align-items: center; gap: 10px; max-width: 420px; margin-top: 12px; }
   .meter-row span:first-child { width: 90px; color: #aaa; }
   .meter-row span:last-child { width: 70px; text-align: right; font-variant-numeric: tabular-nums; }
   .meter { flex: 1; height: 14px; background: #222; border-radius: 7px; overflow: hidden; }
   .meter div { height: 100%; width: 0; background: #6c6; transition: width .05s linear; }
-  .seg { display: flex; max-width: 420px; margin-top: 10px; }
-  .seg button { flex: 1; border-radius: 0; }
-  .seg button:first-child { border-radius: 8px 0 0 8px; }
-  .seg button:last-child { border-radius: 0 8px 8px 0; }
-  .seg button + button { border-left: none; }
+  summary { cursor: pointer; color: #aaa; }
   .layer-row { max-width: 420px; margin-top: 14px; }
   .layer-row select { margin-top: 6px; }
   .layer-row .meter-row { margin-top: 8px; }
-  .seg button.on { background: #2d4a2d; border-color: #6c6; color: #fff; }
 </style>
 
 <h1 style="margin-top:32px">Bluetooth speaker</h1>
@@ -100,52 +87,67 @@ Pair a new speaker once on the Pi: <code>bluetoothctl</code> &rarr; <code>scan o
   #pair-list li small { display: block; color: #888; }
   #pair-list .empty { color: #888; justify-content: center; }
 </style>
+
+<details id="debug-tone" style="margin-top:32px;max-width:420px">
+  <summary><h1 style="display:inline">Debug: test tone</h1></summary>
+  <div style="color:#aaa;font-size:.9rem;margin-top:8px">A plain chord whose volume follows gyro speed, for checking
+  the sensor &rarr; sound path. Not the real audio; it can't play while the layers are on.</div>
+  <div class="btns"><button id="mo-toggle">Start tone</button></div>
+  <div class="meter-row"><span>Gyro speed</span><div class="meter"><div id="mo-rate" style="background:#58a"></div></div><span id="mo-rate-n">0 °/s</span></div>
+  <div class="meter-row"><span>Volume</span><div class="meter"><div id="mo-gain"></div></div><span id="mo-gain-n">0%</span></div>
+  <label style="display:block;margin-top:14px">Full volume at <b id="mo-full-n">150</b> °/s
+    <input id="mo-full" type="range" min="20" max="500" step="10" value="150" style="width:100%"></label>
+  <div id="mo-msg" class="bad" style="font-size:.9rem;margin-top:6px"></div>
+</details>
 <script>
-const calBtn = document.getElementById("cal-btn"), calMsg = document.getElementById("cal-msg");
-const calS = document.getElementById("cal-s");
+// Calibration. Gyro: zero offset. Rest: offset + IntensityEstimator floor.
+// Swinging: IntensityEstimator max. Rest/swing return {message, floor, max_val, floor_dps, max_dps}.
+const calMsg = document.getElementById("cal-msg"), calS = document.getElementById("cal-s");
+const calRange = document.getElementById("cal-range");
 calS.oninput = () => document.getElementById("cal-s-n").textContent = Number(calS.value).toFixed(1);
-calBtn.onclick = async () => {
+
+function renderRange(r) {
+  calRange.textContent = `Intensity range: floor ${r.floor_dps} °/s → max ${r.max_dps} °/s`;
+}
+
+async function runCal(path, doing) {
   const seconds = Number(calS.value);
-  calBtn.disabled = calS.disabled = true;
-  calMsg.textContent = `Calibrating... keep still (${seconds} s)`; calMsg.className = "";
+  const controls = [...document.querySelectorAll("button.cal"), calS];
+  controls.forEach(c => c.disabled = true);
+  calMsg.textContent = `${doing} (${seconds} s)...`; calMsg.className = "";
   try {
-    const r = await fetch("/api/imu/calibrate", {method: "POST", headers: {"Content-Type": "application/json"},
-                                                 body: JSON.stringify({seconds})});
-    const j = await r.json();
-    calMsg.textContent = r.ok ? j.message : "Error: " + j.detail;
-    calMsg.className = r.ok ? "ok" : "bad";
+    const j = await api(path, {seconds});
+    calMsg.textContent = j.message; calMsg.className = "ok";
+    if (j.floor_dps !== undefined) renderRange(j);
   } catch (e) { calMsg.textContent = "Error: " + e.message; calMsg.className = "bad"; }
-  calBtn.disabled = calS.disabled = false;
-};
+  controls.forEach(c => c.disabled = false);
+}
+
+document.getElementById("cal-btn").onclick = () => runCal("/api/imu/calibrate", "Calibrating gyro, keep still");
+document.getElementById("cal-rest").onclick = () => runCal("/api/imu/calibrate-rest", "Measuring rest, keep the swing still");
+document.getElementById("cal-swing").onclick = () => runCal("/api/imu/calibrate-swing", "Measuring swinging, swing hard");
+api("/api/imu/range").then(renderRange).catch(() => {});
 
 let moEnabled = false, fullDps = 150;
 const moToggle = document.getElementById("mo-toggle"), moMsg = document.getElementById("mo-msg");
 const moFull = document.getElementById("mo-full");
 
-async function setMotion(body) {
+// DEBUG test tone (MotionAudio on the Pi, POST /api/debug/tone).
+async function setTone(body) {
   moMsg.textContent = "";
-  const r = await fetch("/api/motion", {method: "POST", headers: {"Content-Type": "application/json"},
+  const r = await fetch("/api/debug/tone", {method: "POST", headers: {"Content-Type": "application/json"},
                                         body: JSON.stringify(body)});
   const j = await r.json();
   if (!r.ok) { moMsg.textContent = j.detail; return; }
-  renderMotion(j);
+  renderTone(j);
 }
-moToggle.onclick = () => setMotion({enabled: !moEnabled});
-document.querySelectorAll(".seg button").forEach(b => b.onclick = () => setMotion({mode: b.dataset.mode}));
+moToggle.onclick = () => setTone({enabled: !moEnabled});
 moFull.oninput = () => document.getElementById("mo-full-n").textContent = moFull.value;
-moFull.onchange = () => setMotion({full_dps: Number(moFull.value)});
+moFull.onchange = () => setTone({full_dps: Number(moFull.value)});
 
-function renderMotion(m) {
+function renderTone(m) {
   moEnabled = m.enabled;
-  moToggle.textContent = m.enabled ? "Stop sound" : "Start sound";
-  const layersMode = m.mode === "layers";
-  document.querySelectorAll(".seg button").forEach(b => b.classList.toggle("on", b.dataset.mode === m.mode));
-  document.getElementById("mo-desc").textContent = layersMode
-    ? "Plays the three library layers; movement drives each layer's volume."
-    : "The faster the sensor turns, the louder it gets; silent at rest.";
-  document.getElementById("mo-full-label").textContent = layersMode ? "All layers full" : "Full volume";
-  setLayersVisible(layersMode);
-  if (m.layer_gains) renderLayerGains(m.layer_gains);
+  moToggle.textContent = m.enabled ? "Stop tone" : "Start tone";
   document.getElementById("mo-gain").style.width = (m.gain * 100) + "%";
   document.getElementById("mo-gain-n").textContent = Math.round(m.gain * 100) + "%";
   document.getElementById("mo-rate").style.width = Math.min(100, m.rate_dps / m.full_dps * 100) + "%";
@@ -156,17 +158,18 @@ function renderMotion(m) {
   }
 }
 
-// "Movement -> layers" mode: the three looping clips from the layers/ folder
+// Motion audio: the three looping clips from the layers/ folder
 // (swing_sim/audio.py AudioEngine). Expects these endpoints on the Pi:
-//   GET  /api/layers  -> {files: ["riser.wav", ...],          files in the library folder
-//                         layers: [{file: str|null}, x3]}     current clip per layer
-//   POST /api/layers  {layer: 0-2, file: str|null}  assign/clear one layer; returns same as GET
-//   POST /api/motion  {mode: "layers"}  switch to layer mode (existing endpoint, new mode)
-// Live per-layer volumes come over the WebSocket as motion.layer_gains: [g0, g1, g2] (0..1).
+//   GET  /api/layers        -> {files: ["riser.wav", ...],          files in the library folder
+//                               layers: [{file: str|null}, x3]}     current clip per layer
+//   POST /api/layers        {layer: 0-2, file: str|null}  assign/clear one layer; returns same as GET
+//   POST /api/layers/audio  {enabled: bool}  start/stop -> {enabled, gains: [g0, g1, g2]}
+// The same {enabled, gains} comes over the WebSocket as "layers", 20x/s, for the meters.
 // Errors use FastAPI's {detail: "..."} like the other endpoints.
-const layersPanel = document.getElementById("layers-panel"), layersRows = document.getElementById("layers-rows");
-const layersStatus = document.getElementById("layers-status");
+const layersRows = document.getElementById("layers-rows"), layersStatus = document.getElementById("layers-status");
+const layersToggle = document.getElementById("layers-toggle");
 const LAYER_COUNT = 3;
+let layersEnabled = false;
 
 function buildLayerRows() {
   for (let i = 0; i < LAYER_COUNT; i++) {
@@ -212,12 +215,19 @@ async function setLayer(i, file) {
   catch (e) { layersStatus.textContent = "Layers: " + e.message; layersStatus.className = "bad"; loadLayers(); }
 }
 
-let layersShown = false;
-function setLayersVisible(show) {
-  layersPanel.hidden = !show;
-  if (show && !layersShown) loadLayers();  // refresh the file list each time the mode is entered
-  layersShown = show;
+function renderLayerAudio(s) {
+  layersEnabled = s.enabled;
+  layersToggle.textContent = s.enabled ? "Stop layers" : "Start layers";
+  if (s.gains) renderLayerGains(s.gains);
 }
+
+layersToggle.onclick = async () => {
+  layersToggle.disabled = true;
+  try { renderLayerAudio(await api("/api/layers/audio", {enabled: !layersEnabled})); }
+  catch (e) { layersStatus.textContent = "Layers: " + e.message; layersStatus.className = "bad"; }
+  layersToggle.disabled = false;
+};
+loadLayers();
 
 const spkStatus = document.getElementById("spk-status");
 const spkSelect = document.getElementById("spk-select");
@@ -352,7 +362,8 @@ function connect() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
-    if (m.motion) renderMotion(m.motion);
+    if (m.tone) renderTone(m.tone);
+    if (m.layers) renderLayerAudio(m.layers);
     if (m.data) {
       st.textContent = "connected - live"; st.className = "ok";
       m.data.accel.forEach((v, i) => document.getElementById("a" + i).textContent = v.toFixed(3));
