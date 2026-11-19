@@ -16,7 +16,7 @@ it's reconnected on the next start too.
 # TODO: master_cap (front and backend), calibration (front and backend), 
 # gain sliders for individual layers, upload for audio files, audio selector, 
 # "timeline" for audio where you can select at what point the layers turn on (Peak of envelope?),
-# multispeaker connection?
+# multispeaker connection?, logging for our data collection
 
 
 import subprocess
