@@ -13,6 +13,12 @@ it's reconnected on the next start too.
     python test_server.py --speaker XX:XX:XX:XX:XX:XX
 """
 
+# TODO: master_cap (front and backend), calibration (front and backend), 
+# gain sliders for individual layers, upload for audio files, audio selector, 
+# "timeline" for audio where you can select at what point the layers turn on (Peak of envelope?),
+# multispeaker connection?
+
+
 import subprocess
 import shutil
 import argparse

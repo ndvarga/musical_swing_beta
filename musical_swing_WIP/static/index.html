@@ -50,7 +50,6 @@
 <div id="spk-status" style="margin-bottom:12px;color:#aaa">checking...</div>
 <select id="spk-select"></select>
 <div class="btns">
-  <button id="spk-use">Use this speaker</button>
   <button id="spk-connect">Connect</button>
   <button id="spk-disconnect">Disconnect</button>
   <button id="spk-tone">Say "bruh"</button>
@@ -236,13 +235,19 @@ let busy = false;
 function renderSpeaker(s) {
   spkStatus.textContent = s.message;
   spkStatus.className = s.connected ? "ok" : (s.mac ? "bad" : "");
-  const current = [...spkSelect.options].map(o => o.value).join();
+  // The first option is always a blank placeholder, so no device is preselected.
+  const current = [...spkSelect.options].map(o => o.value).filter(v => v).join();
   const wanted = s.paired.map(d => d.mac).join();
-  if (current !== wanted) {
-    spkSelect.innerHTML = s.paired.length ? "" : "<option value=''>no paired devices</option>";
+  if (current !== wanted || !spkSelect.options.length) {
+    const keep = spkSelect.value;
+    spkSelect.innerHTML = `<option value=''>${s.paired.length ? "Choose a speaker..." : "no paired devices"}</option>`;
     s.paired.forEach(d => spkSelect.add(new Option(`${d.name} (${d.mac})`, d.mac)));
+    spkSelect.value = keep;  // don't lose a choice made before the list changed
+    if (spkSelect.selectedIndex < 0) spkSelect.selectedIndex = 0;  // it was unpaired: back to placeholder
   }
-  if (s.mac && document.activeElement !== spkSelect) spkSelect.value = s.mac;
+  // Only follow the server's speaker once it's connected; otherwise leave the
+  // placeholder (or whatever the user picked) selected.
+  if (s.connected && s.mac && document.activeElement !== spkSelect) spkSelect.value = s.mac;
 }
 
 async function api(path, body) {
@@ -266,8 +271,11 @@ async function action(path, body, holdMs = 0) {
   document.querySelectorAll(".btns button").forEach(b => b.disabled = false);
 }
 
-document.getElementById("spk-use").onclick = () => action("/api/speaker", {mac: spkSelect.value || null});
-document.getElementById("spk-connect").onclick = () => action("/api/speaker/connect", {});
+// Connect = choose the selected speaker (saved for next start) and connect to it.
+document.getElementById("spk-connect").onclick = () => {
+  if (!spkSelect.value) { spkStatus.textContent = "Choose a speaker first"; spkStatus.className = "bad"; return; }
+  action("/api/speaker", {mac: spkSelect.value});
+};
 document.getElementById("spk-disconnect").onclick = () => action("/api/speaker/disconnect", {});
 document.getElementById("spk-tone").onclick = () => action("/api/speaker/test-tone", {}, 4000);
 
