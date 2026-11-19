@@ -30,10 +30,30 @@
   <input id="cal-s" type="range" min="0.5" max="30" step="0.5" value="2" style="width:100%"></label>
 
 <h1 style="margin-top:32px">Motion audio</h1>
-<div style="color:#aaa;font-size:.9rem;max-width:420px;margin-top:8px">Plays the three library layers; movement drives each layer's volume.</div>
-<div class="btns"><button id="layers-toggle">Start layers</button></div>
-<div id="layers-status" style="color:#aaa;font-size:.9rem;margin-top:14px;max-width:420px"></div>
-<div id="layers-rows"></div>
+<div style="color:#aaa;font-size:.9rem;max-width:420px;margin-top:8px">Each layer comes in once the swing passes
+its start. The white line is the swing right now.</div>
+<div class="btns"><button id="layers-toggle">Start layers</button>
+  <a href="/audio" class="btn-link">Edit timeline &rarr;</a></div>
+<div id="layers-status" style="color:#aaa;font-size:.9rem;margin-top:8px;max-width:420px"></div>
+<div class="tl-ruler"><span>0%</span><span style="left:50%">50%</span><span style="left:100%">100% swing</span></div>
+<div id="tl-track"><div class="tl-empty">No layers. <a href="/audio">Add some on the audio page</a>.</div><div id="tl-cursor"></div></div>
+<style>
+  .btn-link { font-size: 1rem; padding: 10px 12px; border-radius: 8px; border: 1px solid #444; background: #222;
+              color: #eee; text-decoration: none; }
+  .tl-ruler { position: relative; height: 16px; max-width: 420px; margin: 14px 0 4px; font-size: .75rem; color: #888; }
+  .tl-ruler span { position: absolute; transform: translateX(-50%); }
+  .tl-ruler span:first-child { transform: none; } .tl-ruler span:last-child { transform: translateX(-100%); }
+  #tl-track { position: relative; height: 48px; max-width: 420px; background: #1b1b1b; border-radius: 8px; overflow: hidden; }
+  .tl-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #777; font-size: .9rem; }
+  .tl-empty a { color: #8ab4f8; margin-left: 4px; }
+  .tl-clip { position: absolute; top: 0; bottom: 0; border-left: 3px solid; overflow: hidden; padding: 0 6px;
+             box-sizing: border-box; display: flex; flex-direction: column; justify-content: center; font-size: .8rem; }
+  .tl-clip b, .tl-clip small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tl-clip small { color: #ccc; font-variant-numeric: tabular-nums; }
+  .tl-clip .level { position: absolute; left: 0; bottom: 0; height: 4px; width: 0; transition: width .05s linear; }
+  #tl-cursor { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: #fff;
+               pointer-events: none; display: none; z-index: 2; }
+</style>
 <style>
   .meter-row { display: flex; align-items: center; gap: 10px; max-width: 420px; margin-top: 12px; }
   .meter-row span:first-child { width: 90px; color: #aaa; }
@@ -176,76 +196,58 @@ function renderTone(m) {
   }
 }
 
-// Motion audio: the three looping clips from the layers/ folder
-// (swing_sim/audio.py AudioEngine). Expects these endpoints on the Pi:
-//   GET  /api/layers        -> {files: ["riser.wav", ...],          files in the library folder
-//                               layers: [{file: str|null}, x3]}     current clip per layer
-//   POST /api/layers        {layer: 0-2, file: str|null}  assign/clear one layer; returns same as GET
-//   POST /api/layers/audio  {enabled: bool}  start/stop -> {enabled, gains: [g0, g1, g2]}
-// The same {enabled, gains} comes over the WebSocket as "layers", 20x/s, for the meters.
-// Errors use FastAPI's {detail: "..."} like the other endpoints.
-const layersRows = document.getElementById("layers-rows"), layersStatus = document.getElementById("layers-status");
-const layersToggle = document.getElementById("layers-toggle");
-const LAYER_COUNT = 3;
-let layersEnabled = false;
 
-function buildLayerRows() {
-  for (let i = 0; i < LAYER_COUNT; i++) {
-    const row = document.createElement("div");
-    row.className = "layer-row";
-    row.innerHTML = `<div>Layer ${i + 1}</div>
-      <select id="layer-file-${i}"><option value="">(none)</option></select>
-      <div class="meter-row"><span>Volume</span><div class="meter"><div id="layer-gain-${i}"></div></div>
-      <span id="layer-gain-n-${i}">0%</span></div>`;
-    layersRows.appendChild(row);
-    row.querySelector("select").onchange = e => setLayer(i, e.target.value || null);
-  }
-}
-buildLayerRows();
+// Motion audio: read-only view of the timeline (edited on /audio) + start/stop.
+//   GET /api/timeline -> {layers: [{file, start}], lowest start first = engine slots 1..3}
+//   POST /api/layers/audio {enabled}; WebSocket "layers" = {enabled, gains: [slot 1..3], x_norm}
+const TL_COLORS = ["#6c6", "#e9a23b", "#8ab4f8"];
+const tlTrack = document.getElementById("tl-track"), tlCursor = document.getElementById("tl-cursor");
+const layersToggle = document.getElementById("layers-toggle"), layersStatus = document.getElementById("layers-status");
+let layersEnabled = false, tlKey = "";
 
-function renderLayers(j) {
-  layersStatus.textContent = ""; layersStatus.className = "";
-  for (let i = 0; i < LAYER_COUNT; i++) {
-    const sel = document.getElementById(`layer-file-${i}`);
-    if (document.activeElement === sel) continue;
-    sel.innerHTML = "<option value=''>(none)</option>";
-    (j.files || []).forEach(f => sel.add(new Option(f, f)));
-    sel.value = (j.layers && j.layers[i] && j.layers[i].file) || "";
-  }
-}
-
-function renderLayerGains(gains) {
-  gains.slice(0, LAYER_COUNT).forEach((g, i) => {
-    document.getElementById(`layer-gain-${i}`).style.width = (g * 100) + "%";
-    document.getElementById(`layer-gain-n-${i}`).textContent = Math.round(g * 100) + "%";
+function renderTimeline(layers) {
+  const key = JSON.stringify(layers);
+  if (key === tlKey) return;  // unchanged: keep the elements (and their level bars)
+  tlKey = key;
+  tlTrack.querySelectorAll(".tl-clip").forEach(el => el.remove());
+  tlTrack.querySelector(".tl-empty").style.display = layers.length ? "none" : "flex";
+  layers.forEach((l, i) => {
+    const end = i < layers.length - 1 ? layers[i + 1].start : 1, c = TL_COLORS[i % TL_COLORS.length];
+    const el = document.createElement("div");
+    el.className = "tl-clip";
+    el.style.cssText = `left:${l.start * 100}%;width:${(end - l.start) * 100}%;border-color:${c};` +
+                       `background:linear-gradient(to right, ${c}22, ${c}88)`;
+    el.title = `${l.file}: starts at ${Math.round(l.start * 100)}%`;
+    el.innerHTML = `<b></b><small>${Math.round(l.start * 100)}%</small><div class="level" style="background:${c}"></div>`;
+    el.querySelector("b").textContent = l.file;
+    tlTrack.insertBefore(el, tlCursor);
   });
 }
 
-async function loadLayers() {
-  layersStatus.textContent = "Loading layers..."; layersStatus.className = "";
-  try { renderLayers(await api("/api/layers")); }
-  catch (e) { layersStatus.textContent = "Layers: " + e.message; layersStatus.className = "bad"; }
-}
-
-async function setLayer(i, file) {
-  layersStatus.textContent = `Loading ${file || "(none)"} into layer ${i + 1}...`; layersStatus.className = "";
-  try { renderLayers(await api("/api/layers", {layer: i, file})); }
-  catch (e) { layersStatus.textContent = "Layers: " + e.message; layersStatus.className = "bad"; loadLayers(); }
+async function loadTimeline() {
+  try { renderTimeline((await api("/api/timeline")).layers); }
+  catch (e) { layersStatus.textContent = "Timeline: " + e.message; layersStatus.className = "bad"; }
 }
 
 function renderLayerAudio(s) {
   layersEnabled = s.enabled;
   layersToggle.textContent = s.enabled ? "Stop layers" : "Start layers";
-  if (s.gains) renderLayerGains(s.gains);
+  tlCursor.style.display = s.x_norm == null ? "none" : "block";
+  if (s.x_norm != null) tlCursor.style.left = (s.x_norm * 100) + "%";
+  tlTrack.querySelectorAll(".tl-clip .level").forEach((el, i) =>
+    el.style.width = (((s.gains || [])[i] || 0) * 100) + "%");
 }
 
 layersToggle.onclick = async () => {
   layersToggle.disabled = true;
+  layersStatus.textContent = ""; layersStatus.className = "";
   try { renderLayerAudio(await api("/api/layers/audio", {enabled: !layersEnabled})); }
   catch (e) { layersStatus.textContent = "Layers: " + e.message; layersStatus.className = "bad"; }
   layersToggle.disabled = false;
 };
-loadLayers();
+loadTimeline();
+setInterval(loadTimeline, 3000);  // picks up edits made on the audio page (another phone/tab)
+document.addEventListener("visibilitychange", () => { if (!document.hidden) loadTimeline(); });
 
 // Data logging:
 //   GET  /api/log -> {recording, file, rows, seconds, files: [{name, size, modified}]}
@@ -447,7 +449,7 @@ function connect() {
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.tone) renderTone(m.tone);
-    if (m.layers) renderLayerAudio(m.layers);
+    if (m.layers && !layersToggle.disabled) renderLayerAudio(m.layers);
     if (m.log && !logToggle.disabled) renderLog(m.log);  // not mid-click, so the label doesn't flicker
     if (m.data) {
       st.textContent = "connected - live"; st.className = "ok";

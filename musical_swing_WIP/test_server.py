@@ -24,22 +24,24 @@ import shutil
 import argparse
 import asyncio
 import json
+import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from swing_sim.imu_hw import MPU6050Reader
 from swing_sim.speaker import SpeakerManager
-from swing_sim.audio import AudioEngine, AudioConfig, AudioStatus
+from swing_sim.audio import AudioEngine, AudioConfig, AudioStatus, load_library_file
 from swing_sim.control import IntensityEstimator, Controller, EnvelopeConfig, ControlConfig
 # TODO: implement the API calls for these
 from swing_sim.calibration import CalibrationManager, CalibrationResult
@@ -597,7 +599,190 @@ def set_layer_audio(s: LayerAudioSettings):
     return layer_audio_state()
 
 def layer_audio_state() -> dict:
-    return {"enabled": layers.running, "gains": [round(g, 3) for g in layers.gains]}
+    # x_norm: the swing intensity (0..1) the thresholds are compared against,
+    # for the live cursor on the /audio timeline. None while stopped.
+    return {"enabled": layers.running, "gains": [round(g, 3) for g in layers.gains],
+            "x_norm": round(estimator.state.x_norm, 3) if layers.running else None}
+
+
+"""
+Audio page (/audio): a library of uploaded clips, and one timeline holding
+up to 3 layers (the engine's 3 slots). Each layer comes in at its own start
+point on the swing intensity (0..1). The engine needs slot 1 lowest, so the
+layers are sorted by start into slots 1..3, and starts are kept MIN_GAP
+apart: each layer fades in between its start and the next layer's start
+(swing_sim/control.py). Unused slots sit at 100%, so the topmost layer fades
+in all the way to full swing. Saved to test_server_timeline.json and
+restored on the next start.
+"""
+AUDIO_HTML = INDEX_HTML.with_name("audio.html")
+TIMELINE_FILE = Path(__file__).with_name("test_server_timeline.json")
+AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".aif", ".aiff"}
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_LAYERS = 3
+MIN_GAP = 0.05    # smallest gap between starts (the Controller's default hysteresis)
+MAX_START = 0.95  # leaves the topmost layer some room to fade in
+
+
+@app.get("/audio")
+def audio_page():
+    return FileResponse(AUDIO_HTML)
+
+
+def get_thresholds() -> List[float]:
+    return [control_cfg.T1, control_cfg.T2, control_cfg.T3]
+
+
+def normalize_starts(starts: List[float]) -> List[float]:
+    """Sorted starts, pushed apart to MIN_GAP and capped at MAX_START (same rule as the page)."""
+    s = sorted(min(MAX_START, max(0.0, float(t))) for t in starts)
+    for i in range(1, len(s)):
+        s[i] = max(s[i], s[i - 1] + MIN_GAP)
+    for i in reversed(range(len(s))):
+        s[i] = min(s[i], MAX_START if i == len(s) - 1 else s[i + 1] - MIN_GAP)
+    return [round(t, 3) for t in s]
+
+
+def timeline_layers() -> List[dict]:
+    """[{file, start}] for the slots in use, lowest start first."""
+    return [{"file": f, "start": round(t, 3)}
+            for f, t in zip(audio.current_assignments(), get_thresholds()) if f]
+
+
+def timeline_state() -> dict:
+    files = [f for f in audio.library_files() if Path(f).suffix.lower() in AUDIO_EXTS]
+    return {"files": files, "layers": timeline_layers(),
+            "max_layers": MAX_LAYERS, "min_gap": MIN_GAP, "max_start": MAX_START}
+
+
+def apply_timeline(layers: List[dict]) -> None:
+    """
+    Puts [{file, start}] (any order, at most MAX_LAYERS) on the engine:
+    sorted by start into slots 1..3, empty slots cleared and parked at 100%.
+    Only reloads a slot whose file changed. Raises like assign_layer does.
+    """
+    layers = sorted(layers, key=lambda l: l["start"])
+    starts = normalize_starts([l["start"] for l in layers])
+    current = audio.current_assignments()
+    for i in range(MAX_LAYERS):
+        f = layers[i]["file"] if i < len(layers) else None
+        if f != current[i]:
+            audio.assign_layer(i, f)
+    control_cfg.T1, control_cfg.T2, control_cfg.T3 = starts + [1.0] * (MAX_LAYERS - len(starts))
+
+
+def save_timeline() -> None:
+    TIMELINE_FILE.write_text(json.dumps({"layers": timeline_layers()}))
+
+
+def load_timeline() -> None:
+    """Restores the saved timeline (or tidies the default one); unloadable files are skipped."""
+    try:
+        saved = json.loads(TIMELINE_FILE.read_text())
+    except (OSError, ValueError):
+        saved = {}
+    if "layers" in saved:
+        layers = saved["layers"]
+    elif "files" in saved:  # older format: {files: [3], thresholds: [3]}
+        layers = [{"file": f, "start": t} for f, t in zip(saved["files"], saved.get("thresholds", [])) if f]
+    else:
+        layers = timeline_layers()
+    ok = []
+    for l in layers[:MAX_LAYERS]:
+        try:
+            audio._resolve_library_file(l["file"])
+            ok.append({"file": l["file"], "start": float(l["start"])})
+        except Exception as e:
+            print(f"Timeline: skipped {l}: {e}")
+    try:
+        apply_timeline(ok)
+    except Exception as e:
+        print(f"Timeline: couldn't restore: {e}")
+
+
+class TimelineLayer(BaseModel):
+    file: str
+    start: float
+
+
+class TimelineSettings(BaseModel):
+    layers: List[TimelineLayer]
+
+
+@app.get("/api/timeline")
+def get_timeline():
+    return timeline_state()
+
+
+@app.post("/api/timeline")
+def set_timeline(s: TimelineSettings):
+    """
+    Replaces the whole timeline: {layers: [{file, start}]}, up to 3, any
+    order. Adding, removing and dragging layers all go through here.
+    Applies immediately, even while the layers are playing.
+    """
+    if len(s.layers) > MAX_LAYERS:
+        raise HTTPException(400, f"The timeline holds at most {MAX_LAYERS} layers")
+    try:
+        apply_timeline([l.model_dump() for l in s.layers])
+    except (ValueError, FileNotFoundError) as e:
+        raise HTTPException(400, str(e))
+    except (RuntimeError, OSError) as e:
+        raise HTTPException(500, f"Couldn't load a layer: {e}")
+    finally:
+        save_timeline()  # whatever got applied, even if one file failed
+    return timeline_state()
+
+
+def library_filename(raw: str) -> str:
+    """A safe, unused filename in the library folder for an uploaded file."""
+    p = Path(raw or "")
+    ext = p.suffix.lower()
+    if ext not in AUDIO_EXTS:
+        raise HTTPException(400, f"Unsupported file type '{ext or '?'}'. Use: {', '.join(sorted(AUDIO_EXTS))}")
+    stem = re.sub(r"[^A-Za-z0-9 ._-]+", "_", p.stem).strip(" .") or "clip"
+    taken = set(audio.library_files())
+    name, n = stem + ext, 2
+    while name in taken:
+        name, n = f"{stem}_{n}{ext}", n + 1
+    return name
+
+
+@app.post("/api/library")
+def upload_library_file(file: UploadFile = File(...)):
+    """
+    Adds an audio file to the library. It's decoded once with the same
+    loader the engine uses, so a file that wouldn't play is rejected now
+    rather than leaving a silent layer later. Returns timeline_state().
+    """
+    name = library_filename(file.filename)
+    with tempfile.NamedTemporaryFile(suffix=Path(name).suffix, delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        size = 0
+        while chunk := file.file.read(1024 * 1024):
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                tmp.close(); tmp_path.unlink(missing_ok=True)
+                raise HTTPException(413, f"File is over {MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
+            tmp.write(chunk)
+    try:
+        load_library_file(str(tmp_path), audio_cfg.sample_rate)
+    except Exception as e:
+        tmp_path.unlink(missing_ok=True)
+        print(f"Library: rejected {file.filename}: {e}")
+        raise HTTPException(400, f"{file.filename} isn't an audio file this player can read")
+    shutil.move(str(tmp_path), str(audio.library_path() / name))
+    print(f"Library: added {name} ({size} bytes)")
+    return dict(timeline_state(), added=name)
+
+
+@app.get("/api/library/{name}")
+def get_library_file(name: str):
+    """The raw file, for previewing it on the page."""
+    path = audio.library_path() / name
+    if Path(name).name != name or not path.is_file():
+        raise HTTPException(404, f"No such library file: {name}")
+    return FileResponse(path)
 
 
 @app.post("/api/debug/tone")
@@ -723,6 +908,7 @@ if __name__ == "__main__":
     speaker.set_speaker_mac(mac)
     if args.speaker:
         save_mac(speaker.status().mac)
+    load_timeline()
     speaker.start()
     imu.start()  # gyro bias starts at zero; calibrate from the page's button
     print(f"\n  Speaker: {speaker.status().mac or 'none chosen yet (pick one on the page)'}")

@@ -1,0 +1,354 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Swing audio</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 20px 16px; background: #111; color: #eee; }
+  main { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 1.3rem; margin: 0 0 4px; }
+  a { color: #8ab4f8; }
+  .back { display: inline-block; margin-bottom: 16px; font-size: .9rem; }
+  .hint { color: #aaa; font-size: .9rem; margin-top: 8px; }
+  .msg { color: #aaa; font-size: .9rem; margin-top: 10px; min-height: 1.2em; }
+  .ok { color: #6c6 !important; } .bad { color: #e77 !important; }
+  select, button { font-size: 1rem; padding: 10px 12px; border-radius: 8px; border: 1px solid #444;
+                   background: #222; color: #eee; }
+  button:disabled { opacity: .5; }
+  .btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+
+  /* Timeline: one track, x = swing intensity from 0% (still) to 100% (calibrated max). */
+  .ruler { position: relative; height: 18px; margin: 18px 0 4px; font-size: .75rem; color: #888;
+           font-variant-numeric: tabular-nums; }
+  .ruler span { position: absolute; transform: translateX(-50%); }
+  .ruler span:first-child { transform: none; } .ruler span:last-child { transform: translateX(-100%); }
+  #track { position: relative; height: 64px; background: #1b1b1b; border-radius: 8px; touch-action: none;
+           overflow: hidden; outline: 2px dashed transparent; outline-offset: 2px; }
+  #track.drop { outline-color: #8ab4f8; }
+  #track .empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+                  color: #777; font-size: .9rem; padding: 0 12px; text-align: center; }
+  .clip { position: absolute; top: 0; bottom: 0; border-left: 3px solid; cursor: grab; overflow: hidden;
+          display: flex; flex-direction: column; justify-content: center; padding: 0 8px; box-sizing: border-box;
+          font-size: .85rem; user-select: none; -webkit-user-select: none; }
+  .clip.drag { cursor: grabbing; z-index: 2; box-shadow: 0 0 0 2px #fff6; }
+  .clip b, .clip small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .clip small { color: #ccc; font-variant-numeric: tabular-nums; }
+  .clip .level { position: absolute; left: 0; bottom: 0; height: 4px; width: 0; transition: width .05s linear; }
+  #cursor { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: #fff;
+            pointer-events: none; display: none; z-index: 3; }
+
+  #layer-list { list-style: none; margin: 12px 0 0; padding: 0; }
+  #layer-list li { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #333; font-size: .9rem; }
+  #layer-list .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+  #layer-list .name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  #layer-list .name small { display: block; color: #888; font-variant-numeric: tabular-nums; }
+  #layer-list .meter { width: 70px; height: 8px; background: #222; border-radius: 4px; overflow: hidden; flex: none; }
+  #layer-list .meter div { height: 100%; width: 0; transition: width .05s linear; }
+  #layer-list button { padding: 6px 10px; font-size: .85rem; }
+
+  /* Library */
+  #lib-list { list-style: none; margin: 10px 0 0; padding: 0; }
+  #lib-list li { display: flex; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid #333; }
+  #lib-list li[draggable="true"] { cursor: grab; }
+  #lib-list li .name { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: .95rem; }
+  #lib-list li button { padding: 6px 10px; font-size: .85rem; }
+  #lib-list .empty { color: #888; }
+  #upload { display: none; }
+</style></head>
+<body><main>
+<a class="back" href="/">&larr; Main page</a>
+
+<h1>Timeline</h1>
+<div class="hint">Up to 3 layers. Each one comes in once the swing passes its start, and fades up to full
+volume by the next layer's start. Drag a layer along the timeline to move it.</div>
+<div class="btns"><button id="layers-toggle">Start layers</button></div>
+<div id="tl-msg" class="msg"></div>
+<div class="ruler"><span>0%</span><span style="left:25%">25%</span><span style="left:50%">50%</span>
+  <span style="left:75%">75%</span><span style="left:100%">100% swing</span></div>
+<div id="track"><div class="empty">No layers yet. Add files from the library below.</div><div id="cursor"></div></div>
+<ul id="layer-list"></ul>
+
+<h1 style="margin-top:36px">Library</h1>
+<div class="hint">Audio files on the Pi (WAV, MP3, FLAC, OGG, AIFF). <b>Add</b> puts one on the timeline as a
+layer. On a computer you can also drag a file onto the timeline.</div>
+<div class="btns">
+  <button id="upload-btn" type="button">Upload audio…</button>
+  <input id="upload" type="file" accept=".wav,.mp3,.flac,.ogg,.aif,.aiff,audio/*" multiple>
+</div>
+<div id="lib-msg" class="msg"></div>
+<ul id="lib-list"></ul>
+</main>
+
+<script>
+// Endpoints (test_server.py):
+//   GET  /api/timeline -> {files, layers: [{file, start}] (lowest start first, = engine slots 1..3),
+//                          max_layers, min_gap, max_start}
+//   POST /api/timeline {layers: [{file, start}]}  replaces the whole timeline; same reply
+//   POST /api/library (multipart "file"), GET /api/library/{name}
+//   POST /api/layers/audio {enabled}; WebSocket "layers" = {enabled, gains: [slot 1..3], x_norm}
+const COLORS = ["#6c6", "#e9a23b", "#8ab4f8"];
+let files = [], MAX = 3, GAP = 0.05, MAX_START = 0.95;
+// Local layers: {key, file, start, color}. key/color stick to a layer while it's dragged
+// past others, even though the server re-sorts layers into slots by start.
+let layers = [], nextKey = 1, dragKey = null, saving = false;
+let liveGains = [0, 0, 0], layersEnabled = false;
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} :
+    {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.detail || r.statusText);
+  return j;
+}
+function say(el, text, cls = "") { el.textContent = text; el.className = "msg " + cls; }
+const tlMsg = document.getElementById("tl-msg"), libMsg = document.getElementById("lib-msg");
+const pct = t => Math.round(t * 100) + "%";
+const sorted = () => [...layers].sort((a, b) => a.start - b.start);
+
+// Same rule as the server: sorted, at least GAP apart, topmost at most MAX_START.
+function normalize() {
+  const s = sorted();
+  s.forEach((l, i) => { l.start = Math.min(MAX_START, Math.max(0, l.start));
+                        if (i) l.start = Math.max(l.start, s[i - 1].start + GAP); });
+  for (let i = s.length - 1; i >= 0; i--)
+    s[i].start = Math.round(Math.min(s[i].start, i === s.length - 1 ? MAX_START : s[i + 1].start - GAP) * 1000) / 1000;
+}
+
+// Takes the server's layers, keeping each local layer's key/colour where the file+order still match.
+function adopt(j) {
+  files = j.files; MAX = j.max_layers; GAP = j.min_gap; MAX_START = j.max_start;
+  const old = sorted();
+  layers = j.layers.map((l, i) => {
+    const prev = old.find(o => o.file === l.file && !o.taken && Math.abs(o.start - l.start) < 0.06) ||
+                 old.find(o => o.file === l.file && !o.taken);
+    if (prev) prev.taken = true;
+    return {key: prev ? prev.key : nextKey++, file: l.file, start: l.start, color: prev ? prev.color : null};
+  });
+  layers.forEach(l => { if (!l.color) l.color = COLORS.find(c => !layers.some(o => o.color === c)); });
+  render();
+}
+
+async function save(msg) {
+  saving = true;
+  try {
+    adopt(await api("/api/timeline", {layers: sorted().map(l => ({file: l.file, start: l.start}))}));
+    say(tlMsg, msg || "Saved.", "ok");
+  } catch (e) {
+    say(tlMsg, e.message, "bad");
+    adopt(await api("/api/timeline").catch(() => ({files, layers: [], max_layers: MAX, min_gap: GAP, max_start: MAX_START})));
+  }
+  saving = false;
+}
+
+// ---------- Timeline ----------
+const track = document.getElementById("track"), cursor = document.getElementById("cursor");
+const layerList = document.getElementById("layer-list");
+const clipEls = new Map();  // key -> element, reused so a drag survives re-renders
+
+function clipEl(l) {
+  let el = clipEls.get(l.key);
+  if (el) return el;
+  el = document.createElement("div");
+  el.className = "clip";
+  el.innerHTML = "<b></b><small></small><div class='level'></div>";
+  setupDrag(el, l.key);
+  track.appendChild(el);
+  clipEls.set(l.key, el);
+  return el;
+}
+
+function renderTimeline() {
+  const s = sorted();
+  track.querySelector(".empty").style.display = s.length ? "none" : "flex";
+  for (const [key, el] of clipEls) if (!layers.some(l => l.key === key)) { el.remove(); clipEls.delete(key); }
+  s.forEach((l, i) => {
+    const el = clipEl(l), end = i < s.length - 1 ? s[i + 1].start : 1;
+    // A clip's block runs from its start to the next layer's start (where it reaches full volume).
+    el.style.left = (l.start * 100) + "%";
+    el.style.width = (Math.max(0, end - l.start) * 100) + "%";
+    el.style.borderColor = l.color;
+    el.style.background = `linear-gradient(to right, ${l.color}22, ${l.color}88)`;
+    el.querySelector("b").textContent = l.file;
+    el.querySelector("small").textContent = pct(l.start);
+    el.querySelector(".level").style.background = l.color;
+    el.title = `${l.file}: starts at ${pct(l.start)}, full by ${pct(end)}`;
+  });
+  renderLayerList();
+  renderGains();
+}
+
+function renderLayerList() {
+  layerList.innerHTML = "";
+  sorted().forEach((l, i, s) => {
+    const li = document.createElement("li");
+    const end = i < s.length - 1 ? s[i + 1].start : 1;
+    li.innerHTML = `<span class="dot" style="background:${l.color}"></span>
+      <div class="name"></div><div class="meter" title="Volume"><div style="background:${l.color}"></div></div>
+      <button>Remove</button>`;
+    const name = li.querySelector(".name");
+    name.textContent = l.file;
+    const sub = document.createElement("small");
+    sub.textContent = `starts at ${pct(l.start)} · full by ${pct(end)}`;
+    name.appendChild(sub);
+    li.querySelector("button").onclick = () => {
+      layers = layers.filter(o => o.key !== l.key);
+      renderTimeline(); save(`Removed ${l.file}.`);
+    };
+    layerList.appendChild(li);
+  });
+}
+
+function renderGains() {  // slot i = i-th lowest start
+  const s = sorted(), meters = layerList.querySelectorAll(".meter div");
+  s.forEach((l, i) => {
+    const g = dragKey === null ? (liveGains[i] || 0) : 0;
+    if (meters[i]) meters[i].style.width = (g * 100) + "%";
+    clipEls.get(l.key).querySelector(".level").style.width = (g * 100) + "%";
+  });
+}
+
+const fromEvent = e => { const r = track.getBoundingClientRect(); return (e.clientX - r.left) / r.width; };
+
+function setupDrag(el, key) {
+  let grab = 0, startX = 0, moved = false;
+  el.addEventListener("pointerdown", e => {
+    if (saving) return;
+    const l = layers.find(o => o.key === key);
+    dragKey = key; grab = fromEvent(e) - l.start; startX = e.clientX; moved = false;
+    el.setPointerCapture(e.pointerId); el.classList.add("drag"); e.preventDefault();
+  });
+  el.addEventListener("pointermove", e => {
+    if (dragKey !== key) return;
+    if (Math.abs(e.clientX - startX) > 3) moved = true;
+    const l = layers.find(o => o.key === key);
+    l.start = Math.round(Math.min(MAX_START, Math.max(0, fromEvent(e) - grab)) * 100) / 100;
+    renderTimeline();
+  });
+  const end = () => {
+    if (dragKey !== key) return;
+    dragKey = null; el.classList.remove("drag");
+    if (!moved) return renderTimeline();
+    normalize(); renderTimeline(); save();
+  };
+  el.addEventListener("pointerup", end);
+  el.addEventListener("pointercancel", end);
+}
+
+// New layer: at `start`, or the middle of the biggest empty stretch.
+function addLayer(file, start) {
+  if (layers.length >= MAX) { say(tlMsg, `The timeline holds ${MAX} layers. Remove one first.`, "bad"); return; }
+  if (start === undefined) {
+    const pts = [0, ...sorted().map(l => l.start), 1];
+    let best = 0;
+    for (let i = 1; i < pts.length; i++) if (pts[i] - pts[i - 1] > pts[best + 1] - pts[best]) best = i - 1;
+    start = (pts[best] + pts[best + 1]) / 2;
+  }
+  layers.push({key: nextKey++, file, start, color: COLORS.find(c => !layers.some(o => o.color === c))});
+  normalize(); renderTimeline();
+  say(tlMsg, `Loading ${file}…`);
+  save(`Added ${file}.`);
+}
+
+// Drag a library file (desktop) onto the track.
+track.addEventListener("dragover", e => { if (e.dataTransfer.types.includes("text/x-library-file")) { e.preventDefault(); track.classList.add("drop"); } });
+track.addEventListener("dragleave", () => track.classList.remove("drop"));
+track.addEventListener("drop", e => {
+  track.classList.remove("drop");
+  const f = e.dataTransfer.getData("text/x-library-file");
+  if (f) { e.preventDefault(); addLayer(f, fromEvent(e)); }
+});
+
+// Live: volumes, and where the swing is right now (white line).
+function renderLive(s) {
+  layersEnabled = s.enabled;
+  toggle.textContent = s.enabled ? "Stop layers" : "Start layers";
+  liveGains = s.gains || [0, 0, 0];
+  cursor.style.display = s.x_norm == null ? "none" : "block";
+  if (s.x_norm != null) cursor.style.left = (s.x_norm * 100) + "%";
+  renderGains();
+}
+const toggle = document.getElementById("layers-toggle");
+toggle.onclick = async () => {
+  toggle.disabled = true;
+  try { renderLive(await api("/api/layers/audio", {enabled: !layersEnabled})); }
+  catch (e) { say(tlMsg, e.message, "bad"); }
+  toggle.disabled = false;
+};
+
+// ---------- Library ----------
+const libList = document.getElementById("lib-list");
+const preview = new Audio();
+let playing = null;
+
+function renderLibrary() {
+  libList.innerHTML = files.length ? "" : "<li class='empty'>No audio files yet. Upload one.</li>";
+  const full = layers.length >= MAX;
+  files.forEach(f => {
+    const li = document.createElement("li");
+    li.draggable = true;
+    li.ondragstart = e => { e.dataTransfer.setData("text/x-library-file", f); e.dataTransfer.effectAllowed = "copy"; };
+    const play = document.createElement("button");
+    play.textContent = playing === f ? "■" : "▶";
+    play.title = playing === f ? "Stop preview" : "Preview on this device";
+    play.onclick = () => togglePreview(f);
+    const name = document.createElement("div");
+    name.className = "name"; name.textContent = f;
+    const add = document.createElement("button");
+    add.textContent = "Add"; add.disabled = full;
+    add.title = full ? `The timeline holds ${MAX} layers` : "Add to the timeline as a layer";
+    add.onclick = () => addLayer(f);
+    li.append(play, name, add);
+    libList.appendChild(li);
+  });
+}
+
+function togglePreview(f) {
+  if (playing === f) { preview.pause(); playing = null; }
+  else { preview.src = "/api/library/" + encodeURIComponent(f); preview.play().catch(e => say(libMsg, e.message, "bad")); playing = f; }
+  renderLibrary();
+}
+preview.onended = () => { playing = null; renderLibrary(); };
+
+function uploadOne(file) {  // XHR rather than fetch, for upload progress
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest(), form = new FormData();
+    form.append("file", file);
+    xhr.open("POST", "/api/library");
+    xhr.upload.onprogress = e => { if (e.lengthComputable) say(libMsg, `Uploading ${file.name}… ${Math.round(e.loaded / e.total * 100)}%`); };
+    xhr.upload.onload = () => say(libMsg, `Checking ${file.name}…`);
+    xhr.onload = () => {
+      let j = {}; try { j = JSON.parse(xhr.responseText); } catch (e) {}
+      xhr.status < 300 ? resolve(j) : reject(new Error(j.detail || xhr.statusText));
+    };
+    xhr.onerror = () => reject(new Error("network error"));
+    xhr.send(form);
+  });
+}
+
+const uploadInput = document.getElementById("upload"), uploadBtn = document.getElementById("upload-btn");
+uploadBtn.onclick = () => uploadInput.click();
+uploadInput.onchange = async () => {
+  const picked = [...uploadInput.files];
+  uploadInput.value = "";
+  uploadBtn.disabled = true;
+  const added = [], failed = [];
+  for (const f of picked) {
+    try { const j = await uploadOne(f); added.push(j.added); files = j.files; renderLibrary(); }
+    catch (e) { failed.push(`${f.name}: ${e.message}`); }
+  }
+  uploadBtn.disabled = false;
+  if (failed.length) say(libMsg, (added.length ? `Added ${added.join(", ")}. ` : "") + "Failed: " + failed.join("; "), "bad");
+  else say(libMsg, `Added ${added.join(", ")}.`, "ok");
+};
+
+// ---------- Load + live updates ----------
+function render() { renderTimeline(); renderLibrary(); }
+api("/api/timeline").then(adopt).catch(e => say(tlMsg, e.message, "bad"));
+
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onmessage = ev => { const m = JSON.parse(ev.data); if (m.layers && !toggle.disabled) renderLive(m.layers); };
+  ws.onclose = () => setTimeout(connect, 1000);
+}
+connect();
+</script>
+</body></html>
