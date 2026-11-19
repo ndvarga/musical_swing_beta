@@ -44,7 +44,26 @@
   .layer-row { max-width: 420px; margin-top: 14px; }
   .layer-row select { margin-top: 6px; }
   .layer-row .meter-row { margin-top: 8px; }
+  #log-toggle.rec { border-color: #e77; color: #e77; }
+  #log-toggle.rec::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 8px;
+                            border-radius: 50%; background: #e77; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: .2; } }
+  #log-list { list-style: none; margin: 8px 0 0; padding: 0; max-width: 420px; }
+  #log-list li { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #333; font-size: .9rem; }
+  #log-list li div { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  #log-list li small { display: block; color: #888; font-variant-numeric: tabular-nums; }
+  #log-list a { color: #8ab4f8; }
 </style>
+
+<h1 style="margin-top:32px">Data logging</h1>
+<div style="color:#aaa;font-size:.9rem;max-width:420px;margin-top:8px">Records what the layers do to a CSV on the Pi,
+50 rows a second, while the layer audio is playing (Start layers above). Each recording is a new file.</div>
+<div class="btns"><button id="log-toggle">Record</button></div>
+<div id="log-status" style="color:#aaa;font-size:.9rem;margin-top:8px;max-width:420px"></div>
+<details style="margin-top:12px;max-width:420px">
+  <summary>Recordings</summary>
+  <ul id="log-list"></ul>
+</details>
 
 <h1 style="margin-top:32px">Bluetooth speaker</h1>
 <div id="spk-status" style="margin-bottom:12px;color:#aaa">checking...</div>
@@ -228,6 +247,63 @@ layersToggle.onclick = async () => {
 };
 loadLayers();
 
+// Data logging:
+//   GET  /api/log -> {recording, file, rows, seconds, files: [{name, size, modified}]}
+//   POST /api/log {enabled} -> same; GET /api/log/files/{name} downloads a CSV
+// The WebSocket's "log" ({recording, file, rows, seconds}) keeps the counter live.
+const logToggle = document.getElementById("log-toggle"), logStatus = document.getElementById("log-status");
+const logList = document.getElementById("log-list");
+let logRecording = false;
+
+function fmtSize(b) { return b >= 1048576 ? (b / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(b / 1024)) + " KB"; }
+function fmtTime(s) { const m = Math.floor(s / 60); return `${m}:${String(Math.round(s % 60)).padStart(2, "0")}`; }
+
+function renderLog(l) {
+  const changed = l.recording !== logRecording;
+  logRecording = l.recording;
+  logToggle.textContent = l.recording ? "Stop recording" : "Record";
+  logToggle.classList.toggle("rec", l.recording);
+  if (l.recording) {
+    logStatus.textContent = `${l.file} · ${fmtTime(l.seconds)} · ${l.rows} rows` +
+      (l.rows ? "" : " (waiting for the layer audio)");
+    logStatus.className = "";
+  }
+  if (changed && !l.recording) loadLog();  // a finished recording: refresh the list
+}
+
+function renderLogFiles(files) {
+  logList.innerHTML = files.length ? "" : "<li style='color:#888'>No recordings yet.</li>";
+  files.forEach(f => {
+    const li = document.createElement("li");
+    const info = document.createElement("div");
+    info.textContent = f.name;
+    const sub = document.createElement("small");
+    sub.textContent = new Date(f.modified * 1000).toLocaleString() + " · " + fmtSize(f.size);
+    info.appendChild(sub);
+    const a = document.createElement("a");
+    a.href = "/api/log/files/" + encodeURIComponent(f.name);
+    a.textContent = "Download"; a.setAttribute("download", f.name);
+    li.append(info, a);
+    logList.appendChild(li);
+  });
+}
+
+async function loadLog() {
+  try { const j = await api("/api/log"); renderLog(j); renderLogFiles(j.files); }
+  catch (e) { logStatus.textContent = "Logging: " + e.message; logStatus.className = "bad"; }
+}
+
+logToggle.onclick = async () => {
+  logToggle.disabled = true;
+  try {
+    const j = await api("/api/log", {enabled: !logRecording});
+    renderLog(j); renderLogFiles(j.files);
+    if (!j.recording) { logStatus.textContent = "Saved."; logStatus.className = "ok"; }
+  } catch (e) { logStatus.textContent = "Logging: " + e.message; logStatus.className = "bad"; }
+  logToggle.disabled = false;
+};
+loadLog();
+
 const spkStatus = document.getElementById("spk-status");
 const spkSelect = document.getElementById("spk-select");
 let busy = false;
@@ -372,6 +448,7 @@ function connect() {
     const m = JSON.parse(ev.data);
     if (m.tone) renderTone(m.tone);
     if (m.layers) renderLayerAudio(m.layers);
+    if (m.log && !logToggle.disabled) renderLog(m.log);  // not mid-click, so the label doesn't flicker
     if (m.data) {
       st.textContent = "connected - live"; st.className = "ok";
       m.data.accel.forEach((v, i) => document.getElementById("a" + i).textContent = v.toFixed(3));

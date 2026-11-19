@@ -43,6 +43,8 @@ from swing_sim.audio import AudioEngine, AudioConfig, AudioStatus
 from swing_sim.control import IntensityEstimator, Controller, EnvelopeConfig, ControlConfig
 # TODO: implement the API calls for these
 from swing_sim.calibration import CalibrationManager, CalibrationResult
+from swing_sim.logging_utils import DataLogger
+from swing_sim.config import AppConfig, project_path
 
 try:
     import numpy as np
@@ -281,6 +283,7 @@ env_cfg = EnvelopeConfig()
 estimator = IntensityEstimator(env_cfg)
 control_cfg = ControlConfig()
 controller = Controller(control_cfg)
+logger = DataLogger()
 
 INDEX_HTML = Path(__file__).with_name("static") / "index.html"
 
@@ -526,12 +529,14 @@ class LayerRunner:
         sample = self.imu.get_latest()
         if sample is None or self.imu.seconds_since_last_sample() > STALE_S:
             self.audio.set_fault_mute("imu", True)
+            log_step(status="IMU signal lost -- audio muted")
             return
         self.audio.set_fault_mute("imu", False)
         raw_feature = self.imu.raw_feature_from(sample)
         state = self.estimator.update(raw_feature, dt)
         ctrl_out = self.controller.update(state.x_norm, dt)
-        #what hsould it do if it chatters
+        log_step(state=state, ctrl_out=ctrl_out, gyro_y=float(sample.gyro_xyz[1]))
+        #what should it do if it chatters
         if ctrl_out.chatter_flag:
             self.audio.set_fault_mute("chatter", True)
             return
@@ -612,6 +617,72 @@ def set_debug_tone(s: ToneSettings):
     return motion.state()
 
 
+"""
+Data logging: a CSV row per layer step (50/s) while recording, written to
+logs/ with a snapshot of the config the run started with. Used by the
+Record button on the main page.
+"""
+LOGS_DIR = project_path("logs")
+
+
+def log_step(state=None, ctrl_out=None, gyro_y: float = 0.0, status: str = "") -> None:
+    """One row for the current step; a no-op unless recording."""
+    if not logger.recording:
+        return
+    row = {"t": round(logger.elapsed(), 3), "mode": control_cfg.mode, "gyro_y": gyro_y, "status": status}
+    if state is not None:
+        row.update(raw_feature=state.raw_feature, envelope=state.envelope, x_norm=state.x_norm)
+    if ctrl_out is not None:
+        g1, g2, g3 = ctrl_out.gains
+        row.update(gain1=g1, gain2=g2, gain3=g3, master_cap=ctrl_out.master_cap,
+                   quiet=ctrl_out.quiet, status=ctrl_out.status)
+    logger.log_row(row)
+
+
+def log_state() -> dict:
+    """{recording, file, rows, seconds}"""
+    return {"recording": logger.recording,
+            "file": Path(logger.path).name if logger.path else None,
+            "rows": logger.rows, "seconds": round(logger.elapsed(), 1)}
+
+
+def log_files() -> list:
+    """Recorded CSVs, newest first: [{name, size, modified}]"""
+    if not LOGS_DIR.is_dir():
+        return []
+    files = sorted(LOGS_DIR.glob("run_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return [{"name": p.name, "size": p.stat().st_size, "modified": round(p.stat().st_mtime)} for p in files]
+
+
+class LogSettings(BaseModel):
+    enabled: bool
+
+
+@app.get("/api/log")
+def get_log():
+    return dict(log_state(), files=log_files())
+
+
+@app.post("/api/log")
+def set_log(s: LogSettings):
+    """Starts (a new file each time) or stops recording. Returns same as GET."""
+    if s.enabled and not logger.recording:
+        path = logger.start(AppConfig(env=env_cfg, ctrl=control_cfg, audio=audio_cfg))
+        print(f"Recording to {path}")
+    elif not s.enabled and logger.recording:
+        print(f"Recording stopped: {logger.path} ({logger.rows} rows)")
+        logger.stop()
+    return get_log()
+
+
+@app.get("/api/log/files/{name}")
+def download_log(name: str):
+    path = LOGS_DIR / name
+    if Path(name).name != name or path.suffix != ".csv" or not path.is_file():
+        raise HTTPException(404, f"No such log: {name}")
+    return FileResponse(path, media_type="text/csv", filename=name)
+
+
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
     await websocket.accept()
@@ -626,7 +697,8 @@ async def ws(websocket: WebSocket):
             if not motion.running:
                 motion.motion_amount()  # keep the speed readout live while the sound is off
             await websocket.send_json({"data": data, "status": status,
-                                       "tone": motion.state(), "layers": layer_audio_state()})
+                                       "tone": motion.state(), "layers": layer_audio_state(),
+                                       "log": log_state()})
             await asyncio.sleep(0.05)  # 20 updates/s
     except WebSocketDisconnect:
         pass
@@ -660,5 +732,6 @@ if __name__ == "__main__":
     finally:
         motion.stop()
         layers.stop()
+        logger.stop()  # closes the CSV cleanly if still recording
         speaker.stop()
         imu.stop()
